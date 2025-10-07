@@ -1,38 +1,52 @@
 import streamlit as st
-import ccxt
+import requests
 import pandas as pd
 
 # Streamlit page settings
 st.set_page_config(page_title="Crypto Data Viewer", page_icon="📊")
 
 # Title
-st.title("📈 Crypto Market Live Data")
+st.title("📈 Crypto Market Live Data (CoinGecko)")
 
-# User se symbol choose karne ka option
-symbol = st.text_input("Enter symbol (e.g. BTC/USDT):", "BTC/USDT")
-timeframe = st.selectbox("Select timeframe:", ["1m", "5m", "15m", "1h", "4h", "1d"])
-limit = st.slider("Number of candles:", 5, 200, 20)
+# Popular coins ka list
+coins = {
+    "Bitcoin": "bitcoin",
+    "Ethereum": "ethereum",
+    "Dogecoin": "dogecoin",
+    "BNB": "binancecoin",
+    "Solana": "solana",
+    "Cardano": "cardano",
+    "XRP": "ripple",
+    "Polygon": "matic-network"
+}
 
-# Exchange init
-exchange = ccxt.binance()
+# User select karega
+coin_name = st.selectbox("Select Coin:", list(coins.keys()))
+coin_id = coins[coin_name]
+currency = st.selectbox("Select currency:", ["usd", "eur", "pkr"])
+days = st.slider("Number of days:", 1, 30, 7)
 
 try:
-    # Fetch OHLCV data
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    # API call without interval
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": currency, "days": days}
+    r = requests.get(url, params=params)
+    data = r.json()
 
-    # DataFrame me convert
-    df = pd.DataFrame(ohlcv, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    if "prices" in data and len(data["prices"]) > 0:
+        prices = data["prices"]
+        df = pd.DataFrame(prices, columns=["Time", "Price"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="ms")
 
-    # Time ko readable banate hain
-    df["Time"] = pd.to_datetime(df["Time"], unit="ms")
+        # Show latest data
+        st.subheader(f"{coin_name} Price in {currency.upper()}")
+        st.dataframe(df.tail())
 
-    # Show data table
-    st.subheader(f"Latest {limit} candles for {symbol}")
-    st.dataframe(df)
-
-    # Line chart of Close prices
-    st.subheader("📉 Closing Price Chart")
-    st.line_chart(df.set_index("Time")["Close"])
+        # Chart
+        st.subheader("📉 Price Chart")
+        st.line_chart(df.set_index("Time")["Price"])
+    else:
+        st.error("⚠️ No data available. Try reducing 'days' or select another coin.")
 
 except Exception as e:
     st.error(f"Error: {str(e)}")
