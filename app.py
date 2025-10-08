@@ -4,6 +4,7 @@ import pytz
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
 import threading
+from collections import defaultdict
 
 # ------------------------------
 # GLOBAL STATE
@@ -13,12 +14,36 @@ trades_data = []
 summary_data = {}
 open_signals = []
 is_running = False
+coin_performance = {}
+time_performance = {}
 
 # Default settings
 config = {
     "initial_capital": 50,
     "risk_per_trade": 0.01,
-    "coins": ["BTC/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT"],
+    # "coins": [
+    #     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+    #     "ADA/USDT", "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT",
+    #     "DOGE/USDT", "LTC/USDT", "ATOM/USDT", "ETC/USDT", "XLM/USDT",
+    #     "BCH/USDT", "FIL/USDT", "ALGO/USDT", "ICP/USDT", "EOS/USDT",
+    #     "AAVE/USDT", "XTZ/USDT", "THETA/USDT", "TRX/USDT", "VET/USDT",
+    #     "XMR/USDT", "SAND/USDT", "MANA/USDT", "NEAR/USDT", "FTM/USDT",
+    #     "EGLD/USDT", "HBAR/USDT", "AXS/USDT", "FTT/USDT", "GRT/USDT",
+    #     "MKR/USDT", "ZEC/USDT", "DASH/USDT", "ENJ/USDT", "COMP/USDT",
+    #     "SNX/USDT", "BAT/USDT", "CHZ/USDT", "SUSHI/USDT", "CRV/USDT",
+    #     "1INCH/USDT", "REN/USDT", "KAVA/USDT", "ANKR/USDT", "OCEAN/USDT"
+    # ],
+    # "coins": [
+    # "HBAR/USDT", "ENJ/USDT", "GRT/USDT", "ZEC/USDT", "FTM/USDT",
+    # "EGLD/USDT", "SNX/USDT", "NEAR/USDT", "DOGE/USDT", "SAND/USDT",
+    # "MANA/USDT", "CHZ/USDT", "LINK/USDT", "CRV/USDT", "DOT/USDT",
+    # "1INCH/USDT", "ALGO/USDT", "FIL/USDT", "OCEAN/USDT", "TRX/USDT",
+    # "XLM/USDT", "VET/USDT", "ADA/USDT", "XMR/USDT", "SOL/USDT",
+    # "BNB/USDT", "BTC/USDT"
+    # ],
+    "coins":["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT"],
+    # coins = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT"]
+
     "timeframe": "1h",
     "daily_trade_limit_per_coin": 5,
     "withdraw_percentage": 0.30,
@@ -107,7 +132,7 @@ def detect_order_block(df, idx):
 # TRADING LOGIC - FIXED CAPITAL UPDATE
 # ------------------------------
 def run_strategy():
-    global trades_data, summary_data, open_signals, is_running
+    global trades_data, summary_data, open_signals, is_running, coin_performance, time_performance
     
     is_running = True
     capital = config["initial_capital"]
@@ -115,6 +140,13 @@ def run_strategy():
     total_invested_volume = 0.0
     trades = []
     open_signals = []
+    
+    # Initialize performance tracking
+    coin_performance = defaultdict(lambda: {"trades": 0, "wins": 0, "losses": 0, "net_profit": 0.0, "total_invested": 0.0})
+    time_performance = {
+        "weekly": defaultdict(lambda: {"trades": 0, "net_profit": 0.0}),
+        "monthly": defaultdict(lambda: {"trades": 0, "net_profit": 0.0})
+    }
     
     days = config["testing_months"] * 30
     
@@ -213,9 +245,10 @@ def run_strategy():
                             pnl = position_size_units * (tp_price - entry_price)
                             break
                     
+                    trade_date = entry_row.name
                     trade = {
                         "symbol": symbol,
-                        "date": entry_row.name.strftime("%Y-%m-%d %H:%M"),
+                        "date": trade_date.strftime("%Y-%m-%d %H:%M"),
                         "type": "LONG",
                         "entry": round(entry_price, 8),
                         "sl": round(sl_price, 8),
@@ -223,9 +256,28 @@ def run_strategy():
                         "invested": round(invested, 8),
                         "position_size": round(position_size_units, 8),
                         "result": result,
-                        "pnl": round(pnl, 8)
+                        "pnl": round(pnl, 8),
+                        "raw_date": trade_date
                     }
                     trades.append(trade)
+                    
+                    # Update coin performance
+                    coin_performance[symbol]["trades"] += 1
+                    coin_performance[symbol]["total_invested"] += invested
+                    coin_performance[symbol]["net_profit"] += pnl
+                    if result == "WIN":
+                        coin_performance[symbol]["wins"] += 1
+                    elif result == "LOSS":
+                        coin_performance[symbol]["losses"] += 1
+                    
+                    # Update time performance
+                    week_key = trade_date.strftime("%Y-W%W")
+                    month_key = trade_date.strftime("%Y-%m")
+                    
+                    time_performance["weekly"][week_key]["trades"] += 1
+                    time_performance["weekly"][week_key]["net_profit"] += pnl
+                    time_performance["monthly"][month_key]["trades"] += 1
+                    time_performance["monthly"][month_key]["net_profit"] += pnl
                     
                     if result == "OPEN":
                         open_signals.append(trade)
@@ -300,9 +352,10 @@ def run_strategy():
                             pnl = position_size_units * (entry_price - tp_price)
                             break
                     
+                    trade_date = entry_row.name
                     trade = {
                         "symbol": symbol,
-                        "date": entry_row.name.strftime("%Y-%m-%d %H:%M"),
+                        "date": trade_date.strftime("%Y-%m-%d %H:%M"),
                         "type": "SHORT",
                         "entry": round(entry_price, 8),
                         "sl": round(sl_price, 8),
@@ -310,9 +363,28 @@ def run_strategy():
                         "invested": round(invested, 8),
                         "position_size": round(position_size_units, 8),
                         "result": result,
-                        "pnl": round(pnl, 8)
+                        "pnl": round(pnl, 8),
+                        "raw_date": trade_date
                     }
                     trades.append(trade)
+                    
+                    # Update coin performance
+                    coin_performance[symbol]["trades"] += 1
+                    coin_performance[symbol]["total_invested"] += invested
+                    coin_performance[symbol]["net_profit"] += pnl
+                    if result == "WIN":
+                        coin_performance[symbol]["wins"] += 1
+                    elif result == "LOSS":
+                        coin_performance[symbol]["losses"] += 1
+                    
+                    # Update time performance
+                    week_key = trade_date.strftime("%Y-W%W")
+                    month_key = trade_date.strftime("%Y-%m")
+                    
+                    time_performance["weekly"][week_key]["trades"] += 1
+                    time_performance["weekly"][week_key]["net_profit"] += pnl
+                    time_performance["monthly"][month_key]["trades"] += 1
+                    time_performance["monthly"][month_key]["net_profit"] += pnl
                     
                     if result == "OPEN":
                         open_signals.append(trade)
@@ -494,9 +566,11 @@ HTML_TEMPLATE = '''
             display: flex;
             gap: 10px;
             margin-bottom: 20px;
+            flex-wrap: wrap;
         }
         .tab {
             flex: 1;
+            min-width: 120px;
             padding: 12px;
             background: white;
             border: 2px solid #e0e0e0;
@@ -506,6 +580,7 @@ HTML_TEMPLATE = '''
             cursor: pointer;
             border-radius: 4px;
             transition: all 0.3s;
+            text-align: center;
         }
         .tab.active { 
             background: #3498db; 
@@ -522,6 +597,7 @@ HTML_TEMPLATE = '''
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
         }
         .content-card h2 { 
             font-size: 18px; 
@@ -619,6 +695,26 @@ HTML_TEMPLATE = '''
         .fixed-investment-panel.active {
             display: block;
         }
+        
+        .performance-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .performance-section {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .performance-section h3 {
+            font-size: 16px;
+            margin-bottom: 15px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 8px;
+        }
     </style>
 </head>
 <body>
@@ -683,11 +779,29 @@ HTML_TEMPLATE = '''
         <div class="summary" id="summary"></div>
         
         <div class="tabs">
-            <button class="tab active" onclick="showTab('signals')">📡 Open Signals</button>
+            <button class="tab active" onclick="showTab('performance')">📈 Performance</button>
+            <button class="tab" onclick="showTab('signals')">📡 Open Signals</button>
             <button class="tab" onclick="showTab('journal')">📖 Trade Journal</button>
         </div>
         
-        <div id="signals" class="tab-content active">
+        <div id="performance" class="tab-content active">
+            <div class="performance-grid">
+                <div class="performance-section">
+                    <h3>💰 Coin-wise Performance</h3>
+                    <div id="coinPerformance"></div>
+                </div>
+                <div class="performance-section">
+                    <h3>📅 Weekly Performance</h3>
+                    <div id="weeklyPerformance"></div>
+                </div>
+                <div class="performance-section">
+                    <h3>🗓️ Monthly Performance</h3>
+                    <div id="monthlyPerformance"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div id="signals" class="tab-content">
             <div class="content-card">
                 <h2>🔔 Active Trading Signals</h2>
                 <div class="filter-bar">
@@ -807,6 +921,69 @@ HTML_TEMPLATE = '''
             }
         }
         
+        function displayPerformance(performanceData) {
+            // Coin Performance
+            let coinHtml = '';
+            if (Object.keys(performanceData.coin_performance).length === 0) {
+                coinHtml = '<div class="empty-state"><p>No coin performance data</p></div>';
+            } else {
+                coinHtml = '<table><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [coin, data] of Object.entries(performanceData.coin_performance)) {
+                    const winRate = data.trades > 0 ? ((data.wins / data.trades) * 100).toFixed(2) : '0.00';
+                    coinHtml += `
+                        <tr>
+                            <td><strong>${coin}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: #27ae60;">${data.wins}</td>
+                            <td style="color: #e74c3c;">${data.losses}</td>
+                            <td>${winRate}%</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                coinHtml += '</tbody></table>';
+            }
+            document.getElementById('coinPerformance').innerHTML = coinHtml;
+            
+            // Weekly Performance
+            let weeklyHtml = '';
+            if (Object.keys(performanceData.weekly_performance).length === 0) {
+                weeklyHtml = '<div class="empty-state"><p>No weekly performance data</p></div>';
+            } else {
+                weeklyHtml = '<table><thead><tr><th>Week</th><th>Trades</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [week, data] of Object.entries(performanceData.weekly_performance)) {
+                    weeklyHtml += `
+                        <tr>
+                            <td><strong>${week}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                weeklyHtml += '</tbody></table>';
+            }
+            document.getElementById('weeklyPerformance').innerHTML = weeklyHtml;
+            
+            // Monthly Performance
+            let monthlyHtml = '';
+            if (Object.keys(performanceData.monthly_performance).length === 0) {
+                monthlyHtml = '<div class="empty-state"><p>No monthly performance data</p></div>';
+            } else {
+                monthlyHtml = '<table><thead><tr><th>Month</th><th>Trades</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [month, data] of Object.entries(performanceData.monthly_performance)) {
+                    monthlyHtml += `
+                        <tr>
+                            <td><strong>${month}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                monthlyHtml += '</tbody></table>';
+            }
+            document.getElementById('monthlyPerformance').innerHTML = monthlyHtml;
+        }
+        
         function runStrategy() {
             const settings = {
                 testing_months: parseInt(document.getElementById('testingMonths').value),
@@ -886,6 +1063,9 @@ HTML_TEMPLATE = '''
                         </div>
                     `;
                 }
+                
+                // Display performance data
+                displayPerformance(data.performance);
                 
                 // Store signals and update coin filter
                 allSignals = data.signals;
@@ -967,6 +1147,11 @@ def data():
         "trades": trades_data,
         "summary": summary_data,
         "signals": open_signals,
+        "performance": {
+            "coin_performance": dict(coin_performance),
+            "weekly_performance": dict(time_performance["weekly"]),
+            "monthly_performance": dict(time_performance["monthly"])
+        },
         "is_running": is_running
     })
 
