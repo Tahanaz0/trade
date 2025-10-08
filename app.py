@@ -1,35 +1,58 @@
-import streamlit as st
 import ccxt
 import pandas as pd
 import pytz
 from datetime import datetime, timedelta
-import time
+from flask import Flask, render_template_string, jsonify, request
+import threading
 
-# ==========================================
-# Streamlit Page Config
-# ==========================================
-st.set_page_config(page_title="SMC Signal System", page_icon="📡", layout="wide")
+# ------------------------------
+# GLOBAL STATE
+# ------------------------------
+app = Flask(__name__)
+trades_data = []
+summary_data = {}
+open_signals = []
+is_running = False
 
-# ==========================================
-# Tabs for Backtest and Signals
-# ==========================================
-tab1, tab2 = st.tabs(["📈 Backtest", "📡 Live Signals"])
+# Default settings
+config = {
+    "initial_capital": 50,
+    "risk_per_trade": 0.01,
+    "coins": ["BTC/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT"],
+    "timeframe": "1h",
+    "daily_trade_limit_per_coin": 5,
+    "withdraw_percentage": 0.30,
+    "reinvest_percentage": 0.70,
+    "volume_multiplier": 1.5,
+    "atr_sl_multiplier": 1.0,
+    "tp_rr": 3,
+    "max_lookforward_bars": 240,
+    "testing_months": 1,
+    "compounding": True,
+    "enable_withdrawal": True,
+    "fixed_investment_mode": False,
+    "fixed_investment_amount": 10
+}
 
-# ==========================================
-# Binance API
-# ==========================================
-exchange = ccxt.binance({'enableRateLimit': True})
+# ------------------------------
+# BINANCE CONNECTION
+# ------------------------------
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'spot'
+    }
+})
 
-# ==========================================
-# Helper Functions (CODE 1 LOGIC)
-# ==========================================
-def fetch_ohlcv(symbol, days=365):
-    """Fetch historical data"""
+# ------------------------------
+# HELPERS
+# ------------------------------
+def fetch_ohlcv(symbol, days=30):
     since = exchange.parse8601((datetime.now().astimezone(pytz.UTC) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ'))
     all_ohlcv = []
     limit = 1000
     while True:
-        ohlcv = exchange.fetch_ohlcv(symbol, "1h", since=since, limit=limit)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=config["timeframe"], since=since, limit=limit)
         if not ohlcv:
             break
         all_ohlcv += ohlcv
@@ -80,246 +103,34 @@ def detect_order_block(df, idx):
     ob_candle = df.iloc[idx-1]
     return (ob_candle["high"], ob_candle["low"])
 
-def get_market_trend(df, month_data):
-    """Determine market trend for a given month"""
-    if len(month_data) < 20:
-        return "Sideways"
-    ema_50_avg = month_data["EMA50"].mean()
-    ema_200_avg = month_data["EMA200"].mean()
-    price_change = (month_data["close"].iloc[-1] - month_data["close"].iloc[0]) / month_data["close"].iloc[0] * 100
-    if ema_50_avg > ema_200_avg and price_change > 2:
-        return "Bullish 📈"
-    elif ema_50_avg < ema_200_avg and price_change < -2:
-        return "Bearish 📉"
-    else:
-        return "Sideways ➡️"
-
-# ==========================================
-# CODE 1 STYLE SIGNAL GENERATION
-# ==========================================
-def generate_code1_signals(symbol, volume_multiplier, atr_sl_multiplier, tp_rr, max_lookforward_bars=240):
-    """
-    CODE 1 LOGIC: Generate accurate signals with order block retest confirmation
-    Returns only OPEN trades like Code 1
-    """
-    try:
-        df = fetch_ohlcv(symbol, days=365)
-        df = add_indicators(df)
-        
-        signals = []
-        daily_trades = {}
-        
-        for i in range(2, len(df)-1):
-            candle = df.iloc[i]
-            date = candle.name.date()
-            
-            if date not in daily_trades:
-                daily_trades[date] = 0
-            if daily_trades[date] >= 5:  # Daily limit
-                continue
-            
-            atr = candle["ATR14"]
-            vol_avg = df["VOL_AVG14"].iloc[i]
-            if pd.isna(atr) or pd.isna(vol_avg):
-                continue
-
-            bos = is_bos(df, i)
-            if not bos:
-                continue
-
-            if candle["volume"] < volume_multiplier * vol_avg:
-                continue
-
-            trend = "bull" if candle["EMA50"] > candle["EMA200"] else "bear"
-            if bos == "bull" and trend != "bull":
-                continue
-            if bos == "bear" and trend != "bear":
-                continue
-
-            ob = detect_order_block(df, i)
-            if ob is None:
-                continue
-            ob_high, ob_low = ob
-
-            # === LONG ENTRY (CODE 1 LOGIC) ===
-            if bos == "bull":
-                entry_idx = None
-                for j in range(i+1, min(i+1+max_lookforward_bars, len(df))):
-                    fc = df.iloc[j]
-                    if fc["low"] <= ob_high + (atr * 0.25) and fc["high"] >= ob_low - (atr * 0.25):
-                        if fc["close"] > fc["open"]:
-                            entry_idx = j
-                            break
-                        if j+1 < len(df):
-                            nc = df.iloc[j+1]
-                            if nc["close"] > nc["open"]:
-                                entry_idx = j+1
-                                break
-                if entry_idx is None:
-                    continue
-
-                entry_row = df.iloc[entry_idx]
-                entry_price = entry_row["close"]
-                sl_price = min(ob_low - atr * 0.1, entry_price - atr * atr_sl_multiplier)
-                risk_per_unit = abs(entry_price - sl_price)
-                if risk_per_unit <= 0:
-                    continue
-
-                tp_price = entry_price + (risk_per_unit * tp_rr)
-                result = "OPEN"
-                
-                # Check if trade is still OPEN
-                for k in range(entry_idx+1, min(len(df), entry_idx + max_lookforward_bars)):
-                    sc = df.iloc[k]
-                    if sc["low"] <= sl_price:
-                        result = "LOSS"
-                        break
-                    elif sc["high"] >= tp_price:
-                        result = "WIN"
-                        break
-
-                # Only show OPEN trades (CODE 1 STYLE)
-                if result == "OPEN":
-                    volume_strength = (candle["volume"] / vol_avg) * 100
-                    rsi = candle["RSI"]
-                    confidence = min(95, 60 + (volume_strength - 100) / 2)
-                    
-                    signals.append({
-                        "symbol": symbol,
-                        "type": "LONG 🟢",
-                        "entry": round(entry_price, 4),
-                        "sl": round(sl_price, 4),
-                        "tp": round(tp_price, 4),
-                        "rr": f"1:{tp_rr}",
-                        "confidence": f"{int(confidence)}%",
-                        "timestamp": entry_row.name,
-                        "rsi": round(rsi, 1),
-                        "volume_strength": f"{int(volume_strength)}%",
-                        "trend": "Bullish BOS + OB Retest",
-                        "ob_zone": f"${round(ob_low, 4)} - ${round(ob_high, 4)}",
-                        "status": "🟢 ACTIVE",
-                        "risk_reward": f"{tp_rr}:1",
-                        "atr_value": round(atr, 4)
-                    })
-                    daily_trades[date] += 1
-
-            # === SHORT ENTRY (CODE 1 LOGIC) ===
-            elif bos == "bear":
-                entry_idx = None
-                for j in range(i+1, min(i+1+max_lookforward_bars, len(df))):
-                    fc = df.iloc[j]
-                    if fc["high"] >= ob_low - (atr * 0.25) and fc["low"] <= ob_high + (atr * 0.25):
-                        if fc["close"] < fc["open"]:
-                            entry_idx = j
-                            break
-                        if j+1 < len(df):
-                            nc = df.iloc[j+1]
-                            if nc["close"] < nc["open"]:
-                                entry_idx = j+1
-                                break
-                if entry_idx is None:
-                    continue
-
-                entry_row = df.iloc[entry_idx]
-                entry_price = entry_row["close"]
-                sl_price = max(ob_high + atr * 0.1, entry_price + atr * atr_sl_multiplier)
-                risk_per_unit = abs(sl_price - entry_price)
-                if risk_per_unit <= 0:
-                    continue
-
-                tp_price = entry_price - (risk_per_unit * tp_rr)
-                result = "OPEN"
-                
-                # Check if trade is still OPEN
-                for k in range(entry_idx+1, min(len(df), entry_idx + max_lookforward_bars)):
-                    sc = df.iloc[k]
-                    if sc["high"] >= sl_price:
-                        result = "LOSS"
-                        break
-                    elif sc["low"] <= tp_price:
-                        result = "WIN"
-                        break
-
-                # Only show OPEN trades (CODE 1 STYLE)
-                if result == "OPEN":
-                    volume_strength = (candle["volume"] / vol_avg) * 100
-                    rsi = candle["RSI"]
-                    confidence = min(95, 60 + (volume_strength - 100) / 2)
-                    
-                    signals.append({
-                        "symbol": symbol,
-                        "type": "SHORT 🔴",
-                        "entry": round(entry_price, 4),
-                        "sl": round(sl_price, 4),
-                        "tp": round(tp_price, 4),
-                        "rr": f"1:{tp_rr}",
-                        "confidence": f"{int(confidence)}%",
-                        "timestamp": entry_row.name,
-                        "rsi": round(rsi, 1),
-                        "volume_strength": f"{int(volume_strength)}%",
-                        "trend": "Bearish BOS + OB Retest",
-                        "ob_zone": f"${round(ob_low, 4)} - ${round(ob_high, 4)}",
-                        "status": "🔴 ACTIVE",
-                        "risk_reward": f"{tp_rr}:1",
-                        "atr_value": round(atr, 4)
-                    })
-                    daily_trades[date] += 1
-
-        return signals
-
-    except Exception as e:
-        st.error(f"Error generating signals for {symbol}: {str(e)}")
-        return []
-
-# ==========================================
-# TAB 1: BACKTEST (CODE 1 LOGIC)
-# ==========================================
-with tab1:
-    st.title("📈 Smart Money Concept (SMC) Strategy Backtester")
+# ------------------------------
+# TRADING LOGIC
+# ------------------------------
+def run_strategy():
+    global trades_data, summary_data, open_signals, is_running
     
-    # User Inputs
-    initial_capital = st.number_input("💰 Initial Capital ($)", value=50.0, min_value=10.0)
-    risk_per_trade = st.slider("🎯 Risk per Trade (%)", 0.5, 5.0, 1.0) / 100
-    use_compounding = st.checkbox("🔄 Use Compounding", value=True)
-    months = st.slider("📆 Months of Backtest", 1, 12, 3)
-    daily_trade_limit_per_coin = st.number_input("🔁 Max Trades per Day per Coin", value=5, min_value=1)
-    tp_rr = st.slider("🎯 Take Profit (R:R)", 1, 5, 3)
-    withdraw_percentage = st.slider("🏦 Withdraw Profit (%)", 0, 100, 30) / 100
-    reinvest_percentage = 1 - withdraw_percentage
-    enable_withdrawals = st.checkbox("💸 Enable Withdrawals", value=True)
-    volume_multiplier = st.slider("📊 Volume Multiplier", 1.0, 3.0, 1.5)
-    atr_sl_multiplier = st.slider("🎯 ATR Stop Loss Multiplier", 0.5, 2.0, 1.0)
-    max_lookforward_bars = st.number_input("🔭 Max Lookforward Bars", value=240, min_value=50, max_value=500)
+    is_running = True
+    capital = config["initial_capital"]
+    total_withdrawn = 0.0
+    total_invested_volume = 0.0
+    trades = []
+    open_signals = []
     
-    coins = st.multiselect(
-        "🪙 Select Coins",
-        ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT"],
-        default=["BTC/USDT", "BNB/USDT"]
-    )
+    days = config["testing_months"] * 30
     
-    run_backtest = st.button("🚀 Run Backtest")
-    
-    if run_backtest:
-        trades = []
-        capital = initial_capital
-        total_withdrawn = 0.0
-        
-        progress = st.progress(0)
-        status_text = st.empty()
-        
-        for ci, symbol in enumerate(coins):
-            status_text.text(f"Fetching {symbol} data...")
-            df = fetch_ohlcv(symbol, days=30 * months)
+    for symbol in config["coins"]:
+        print(f"\nProcessing {symbol} ...")
+        try:
+            df = fetch_ohlcv(symbol, days=days)
             df = add_indicators(df)
             daily_trades = {}
             
-            for i in range(2, len(df) - 1):
+            for i in range(2, len(df)-1):
                 candle = df.iloc[i]
                 date = candle.name.date()
-                
                 if date not in daily_trades:
                     daily_trades[date] = 0
-                if daily_trades[date] >= daily_trade_limit_per_coin:
+                if daily_trades[date] >= config["daily_trade_limit_per_coin"]:
                     continue
                 
                 atr = candle["ATR14"]
@@ -331,7 +142,7 @@ with tab1:
                 if not bos:
                     continue
                 
-                if candle["volume"] < volume_multiplier * vol_avg:
+                if candle["volume"] < config["volume_multiplier"] * vol_avg:
                     continue
                 
                 trend = "bull" if candle["EMA50"] > candle["EMA200"] else "bear"
@@ -345,47 +156,53 @@ with tab1:
                     continue
                 ob_high, ob_low = ob
                 
-                # LONG ENTRY (CODE 1 LOGIC)
+                # LONG ENTRY
                 if bos == "bull":
                     entry_idx = None
-                    for j in range(i + 1, min(i + 1 + max_lookforward_bars, len(df))):
+                    for j in range(i+1, min(i+1+config["max_lookforward_bars"], len(df))):
                         fc = df.iloc[j]
                         if fc["low"] <= ob_high + (atr * 0.25) and fc["high"] >= ob_low - (atr * 0.25):
                             if fc["close"] > fc["open"]:
                                 entry_idx = j
                                 break
-                            if j + 1 < len(df):
-                                nc = df.iloc[j + 1]
+                            if j+1 < len(df):
+                                nc = df.iloc[j+1]
                                 if nc["close"] > nc["open"]:
-                                    entry_idx = j + 1
+                                    entry_idx = j+1
                                     break
+                    
                     if entry_idx is None:
                         continue
                     
                     entry_row = df.iloc[entry_idx]
                     entry_price = entry_row["close"]
-                    sl_price = min(ob_low - atr * 0.1, entry_price - atr * atr_sl_multiplier)
-                    risk_per_unit = abs(entry_price - sl_price)
-                    if risk_per_unit <= 0:
-                        continue
+                    sl_price = min(ob_low - atr * 0.1, entry_price - atr * config["atr_sl_multiplier"])
                     
-                    # CODE 1 STYLE POSITION SIZING
-                    risk_amount = capital * risk_per_trade
-                    position_size_units = risk_amount / risk_per_unit
-                    invested = position_size_units * entry_price
+                    # Fixed Investment Mode
+                    if config["fixed_investment_mode"]:
+                        invested = config["fixed_investment_amount"]
+                        position_size_units = invested / entry_price
+                    else:
+                        risk_amount = capital * config["risk_per_trade"]
+                        risk_per_unit = abs(entry_price - sl_price)
+                        if risk_per_unit <= 0:
+                            continue
+                        
+                        position_size_units = risk_amount / risk_per_unit
+                        invested = position_size_units * entry_price
+                        
+                        if invested > capital:
+                            scale_factor = capital / invested
+                            position_size_units *= scale_factor
+                            invested = capital
                     
-                    # Prevent over-leverage
-                    if invested > capital:
-                        scale_factor = capital / invested
-                        position_size_units *= scale_factor
-                        invested = capital
+                    total_invested_volume += invested
                     
-                    tp_price = entry_price + (risk_per_unit * tp_rr)
-                    
+                    tp_price = entry_price + (abs(entry_price - sl_price) * config["tp_rr"])
                     result = "OPEN"
                     pnl = 0.0
                     
-                    for k in range(entry_idx + 1, min(len(df), entry_idx + max_lookforward_bars)):
+                    for k in range(entry_idx+1, min(len(df), entry_idx + config["max_lookforward_bars"])):
                         sc = df.iloc[k]
                         if sc["low"] <= sl_price:
                             result = "LOSS"
@@ -396,63 +213,79 @@ with tab1:
                             pnl = position_size_units * (tp_price - entry_price)
                             break
                     
-                    capital += pnl
-                    daily_trades[date] += 1
-                    trades.append({
+                    trade = {
                         "symbol": symbol,
-                        "date": entry_row.name,
+                        "date": entry_row.name.strftime("%Y-%m-%d %H:%M"),
                         "type": "LONG",
-                        "entry": round(entry_price, 6),
-                        "sl": round(sl_price, 6),
-                        "tp": round(tp_price, 6),
-                        "invested": round(invested, 6),
-                        "position_size": round(position_size_units, 6),
+                        "entry": round(entry_price, 8),
+                        "sl": round(sl_price, 8),
+                        "tp": round(tp_price, 8),
+                        "invested": round(invested, 8),
+                        "position_size": round(position_size_units, 8),
                         "result": result,
-                        "pnl": round(pnl, 6),
-                        "capital": round(capital, 2)
-                    })
+                        "pnl": round(pnl, 8)
+                    }
+                    trades.append(trade)
+                    
+                    if result == "OPEN":
+                        open_signals.append(trade)
+                    
+                    # Compounding logic
+                    if not config["fixed_investment_mode"]:
+                        if config["compounding"]:
+                            capital += pnl
+                        else:
+                            capital = config["initial_capital"] + sum(t["pnl"] for t in trades)
+                    
+                    daily_trades[date] += 1
                 
-                # SHORT ENTRY (CODE 1 LOGIC)
+                # SHORT ENTRY
                 elif bos == "bear":
                     entry_idx = None
-                    for j in range(i + 1, min(i + 1 + max_lookforward_bars, len(df))):
+                    for j in range(i+1, min(i+1+config["max_lookforward_bars"], len(df))):
                         fc = df.iloc[j]
                         if fc["high"] >= ob_low - (atr * 0.25) and fc["low"] <= ob_high + (atr * 0.25):
                             if fc["close"] < fc["open"]:
                                 entry_idx = j
                                 break
-                            if j + 1 < len(df):
-                                nc = df.iloc[j + 1]
+                            if j+1 < len(df):
+                                nc = df.iloc[j+1]
                                 if nc["close"] < nc["open"]:
-                                    entry_idx = j + 1
+                                    entry_idx = j+1
                                     break
+                    
                     if entry_idx is None:
                         continue
                     
                     entry_row = df.iloc[entry_idx]
                     entry_price = entry_row["close"]
-                    sl_price = max(ob_high + atr * 0.1, entry_price + atr * atr_sl_multiplier)
-                    risk_per_unit = abs(sl_price - entry_price)
-                    if risk_per_unit <= 0:
-                        continue
+                    sl_price = max(ob_high + atr * 0.1, entry_price + atr * config["atr_sl_multiplier"])
                     
-                    # CODE 1 STYLE POSITION SIZING
-                    risk_amount = capital * risk_per_trade
-                    position_size_units = risk_amount / risk_per_unit
-                    invested = position_size_units * entry_price
+                    # Fixed Investment Mode
+                    if config["fixed_investment_mode"]:
+                        invested = config["fixed_investment_amount"]
+                        position_size_units = invested / entry_price
+                    else:
+                        risk_amount = capital * config["risk_per_trade"]
+                        risk_per_unit = abs(sl_price - entry_price)
+                        if risk_per_unit <= 0:
+                            continue
+                        
+                        position_size_units = risk_amount / risk_per_unit
+                        invested = position_size_units * entry_price
+                        
+                        if invested > capital:
+                            scale_factor = capital / invested
+                            position_size_units *= scale_factor
+                            invested = capital
                     
-                    # Prevent over-leverage
-                    if invested > capital:
-                        scale_factor = capital / invested
-                        position_size_units *= scale_factor
-                        invested = capital
+                    total_invested_volume += invested
                     
-                    tp_price = entry_price - (risk_per_unit * tp_rr)
-                    
+                    tp_price = entry_price - (abs(sl_price - entry_price) * config["tp_rr"])
                     result = "OPEN"
                     pnl = 0.0
                     
-                    for k in range(entry_idx + 1, min(len(df), entry_idx + max_lookforward_bars)):
+                    for k in range(entry_idx+1, min(len(df), entry_idx + config["max_lookforward_bars"])):
                         sc = df.iloc[k]
                         if sc["high"] >= sl_price:
                             result = "LOSS"
@@ -463,246 +296,676 @@ with tab1:
                             pnl = position_size_units * (entry_price - tp_price)
                             break
                     
-                    capital += pnl
-                    daily_trades[date] += 1
-                    trades.append({
+                    trade = {
                         "symbol": symbol,
-                        "date": entry_row.name,
+                        "date": entry_row.name.strftime("%Y-%m-%d %H:%M"),
                         "type": "SHORT",
-                        "entry": round(entry_price, 6),
-                        "sl": round(sl_price, 6),
-                        "tp": round(tp_price, 6),
-                        "invested": round(invested, 6),
-                        "position_size": round(position_size_units, 6),
+                        "entry": round(entry_price, 8),
+                        "sl": round(sl_price, 8),
+                        "tp": round(tp_price, 8),
+                        "invested": round(invested, 8),
+                        "position_size": round(position_size_units, 8),
                         "result": result,
-                        "pnl": round(pnl, 6),
-                        "capital": round(capital, 2)
-                    })
-            
-            progress.progress((ci + 1) / len(coins))
-        
-        status_text.text("Processing monthly withdrawals...")
-        
+                        "pnl": round(pnl, 8)
+                    }
+                    trades.append(trade)
+                    
+                    if result == "OPEN":
+                        open_signals.append(trade)
+                    
+                    # Compounding logic
+                    if not config["fixed_investment_mode"]:
+                        if config["compounding"]:
+                            capital += pnl
+                        else:
+                            capital = config["initial_capital"] + sum(t["pnl"] for t in trades)
+                    
+                    daily_trades[date] += 1
+        except Exception as e:
+            print(f"Error processing {symbol}: {e}")
+            continue
+    
+    # Monthly Withdrawal
+    if config["enable_withdrawal"] and not config["fixed_investment_mode"]:
         df_trades = pd.DataFrame(trades)
         if not df_trades.empty:
             df_trades["month"] = pd.to_datetime(df_trades["date"]).dt.to_period("M")
             monthly_profit = df_trades.groupby("month")["pnl"].sum()
-            
-            if enable_withdrawals:
-                for month, profit in monthly_profit.items():
-                    if profit > 0:
-                        withdraw = profit * withdraw_percentage
-                        reinvest = profit * reinvest_percentage
-                        total_withdrawn += withdraw
-                        capital += reinvest
-                        capital -= withdraw
-            
-            wins = len(df_trades[df_trades["result"] == "WIN"])
-            losses = len(df_trades[df_trades["result"] == "LOSS"])
-            total_trades = wins + losses
-            winrate = (wins / total_trades * 100) if total_trades > 0 else 0
-            net_profit = (capital + total_withdrawn) - initial_capital
-            
-            st.success("✅ Backtest Complete!")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Initial Capital", f"${initial_capital:.2f}")
-            with col2:
-                st.metric("Ending Capital", f"${capital:.2f}", f"+${capital - initial_capital:.2f}")
-            with col3:
-                st.metric("Total Withdrawn", f"${total_withdrawn:.2f}")
-            with col4:
-                st.metric("Net Profit", f"${net_profit:.2f}")
-            
-            col5, col6, col7 = st.columns(3)
-            with col5:
-                st.metric("Winrate", f"{winrate:.2f}%")
-            with col6:
-                st.metric("Total Trades", total_trades)
-            with col7:
-                st.metric("Wins / Losses", f"{wins} / {losses}")
-            
-            st.info(f"**Mode:** {'🔄 Compounding' if use_compounding else '💰 Fixed Risk'} | **Withdrawals:** {'✅ Enabled' if enable_withdrawals else '❌ Disabled'}")
-            
-            st.subheader("📊 Trade Journal")
-            st.dataframe(df_trades, use_container_width=True)
-            
-            st.subheader("📈 Equity Curve")
-            st.line_chart(df_trades.set_index("date")["capital"])
-            
-        else:
-            st.error("❌ No trades generated for the selected period and parameters.")
-        
-        status_text.empty()
-        progress.empty()
+            for month, profit in monthly_profit.items():
+                if profit > 0:
+                    withdraw = profit * config["withdraw_percentage"]
+                    reinvest = profit * config["reinvest_percentage"]
+                    total_withdrawn += withdraw
+                    capital += reinvest
+                    capital -= withdraw
+    
+    wins = sum(1 for t in trades if t["result"] == "WIN")
+    losses = sum(1 for t in trades if t["result"] == "LOSS")
+    total_trades = wins + losses
+    winrate = (wins / total_trades * 100) if total_trades > 0 else 0
+    net_profit = (capital + total_withdrawn) - config["initial_capital"]
+    
+    trades_data = trades
+    summary_data = {
+        "initial_capital": config["initial_capital"],
+        "ending_capital": round(capital, 2),
+        "total_withdrawn": round(total_withdrawn, 2),
+        "total_invested_volume": round(total_invested_volume, 2),
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "winrate": round(winrate, 2),
+        "net_profit": round(net_profit, 2)
+    }
+    
+    is_running = False
+    print("\n✅ Strategy execution completed!")
 
-# ==========================================
-# TAB 2: LIVE SIGNALS (CODE 1 LOGIC + CODE 2 UI)
-# ==========================================
-with tab2:
-    st.title("📡 Live Trading Signals - CODE 1 ACCURACY")
-    st.write("✅ **Now using CODE 1 logic: Order Block retest + Only OPEN trades**")
-    
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        signal_coins = st.multiselect(
-            "🪙 Select Coins for Signals",
-            ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "AVAX/USDT", "XRP/USDT", "LINK/USDT", "ADA/USDT"],
-            default=["BTC/USDT", "ETH/USDT", "BNB/USDT"],
-            key="signal_coins"
-        )
-    
-    with col2:
-        auto_refresh = st.checkbox("🔄 Auto-refresh (60s)", value=False)
-    
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        sig_volume_mult = st.slider("📊 Volume Multiplier", 1.0, 3.0, 1.5, key="sig_vol")
-    with col4:
-        sig_atr_mult = st.slider("🎯 ATR SL Multiplier", 0.5, 2.0, 1.0, key="sig_atr")
-    with col5:
-        sig_tp_rr = st.slider("🎯 TP R:R", 1, 5, 3, key="sig_rr")
-    
-    scan_button = st.button("🔍 Scan for CODE 1 Signals", type="primary")
-    
-    if scan_button or auto_refresh:
-        all_signals = []
-        progress_bar = st.progress(0)
-        status = st.empty()
+# ------------------------------
+# FLASK ROUTES
+# ------------------------------
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC Strategy Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         
-        for idx, coin in enumerate(signal_coins):
-            status.text(f"Scanning {coin} with CODE 1 logic... ({idx+1}/{len(signal_coins)})")
-            signals = generate_code1_signals(coin, sig_volume_mult, sig_atr_mult, sig_tp_rr)
-            all_signals.extend(signals)
-            progress_bar.progress((idx + 1) / len(signal_coins))
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        h1 { font-size: 24px; color: #2c3e50; margin-bottom: 5px; }
+        .subtitle { color: #7f8c8d; font-size: 14px; }
         
-        status.empty()
-        progress_bar.empty()
+        .settings-panel {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .form-group { display: flex; flex-direction: column; }
+        .form-group label { 
+            font-size: 13px; 
+            font-weight: 600; 
+            margin-bottom: 5px; 
+            color: #555;
+        }
+        .form-group input, .form-group select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #3498db;
+        }
         
-        if all_signals:
-            st.success(f"✅ Found {len(all_signals)} CODE 1 CONFIRMED signal(s)!")
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        .checkbox-group label {
+            font-size: 14px;
+            cursor: pointer;
+            color: #555;
+        }
+        
+        .btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            font-size: 14px;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .btn:hover { background: #2980b9; }
+        .btn:disabled { background: #95a5a6; cursor: not-allowed; }
+        .btn-block { width: 100%; }
+        
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .summary-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .summary-card h3 { 
+            font-size: 13px; 
+            color: #7f8c8d; 
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .summary-card p { 
+            font-size: 24px; 
+            font-weight: 700;
+            color: #2c3e50;
+        }
+        .summary-card.profit p { color: #27ae60; }
+        .summary-card.loss p { color: #e74c3c; }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            flex: 1;
+            padding: 12px;
+            background: white;
+            border: 2px solid #e0e0e0;
+            color: #555;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        .tab.active { 
+            background: #3498db; 
+            color: white;
+            border-color: #3498db;
+        }
+        .tab:hover { border-color: #3498db; }
+        
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .content-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .content-card h2 { 
+            font-size: 18px; 
+            margin-bottom: 15px;
+            color: #2c3e50;
+        }
+        
+        .filter-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .filter-bar select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            background: white;
+        }
+        .filter-bar label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ecf0f1;
+            font-size: 13px;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #555;
+        }
+        tr:hover { background: #f8f9fa; }
+        
+        .signal-card {
+            background: #f8f9fa;
+            border-left: 4px solid #3498db;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+        }
+        .signal-header { 
+            display: flex; 
+            justify-content: space-between; 
+            margin-bottom: 10px;
+        }
+        .signal-type { 
+            font-weight: 700; 
+            font-size: 16px;
+            color: #2c3e50;
+        }
+        .signal-details { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); 
+            gap: 10px;
+            font-size: 13px;
+        }
+        .signal-details strong { color: #555; }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge.win { background: #d4edda; color: #155724; }
+        .badge.loss { background: #f8d7da; color: #721c24; }
+        .badge.open { background: #fff3cd; color: #856404; }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #95a5a6;
+        }
+        .fixed-investment-panel {
+            display: none;
+            margin-top: 10px;
+        }
+        .fixed-investment-panel.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 SMC Trading Strategy Dashboard</h1>
+            <p class="subtitle">Smart Money Concept Backtesting & Signal Generator</p>
+        </header>
+        
+        <div class="settings-panel">
+            <h2 style="margin-bottom: 15px; font-size: 16px;">⚙️ Configuration</h2>
+            <div class="settings-grid">
+                <div class="form-group">
+                    <label>Testing Period (Months)</label>
+                    <select id="testingMonths">
+                        <option value="1">1 Month</option>
+                        <option value="3">3 Months</option>
+                        <option value="6">6 Months</option>
+                        <option value="12">12 Months</option>
+                        <option value="24">24 Months</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Initial Capital ($)</label>
+                    <input type="number" id="initialCapital" value="50" min="1">
+                </div>
+                <div class="form-group">
+                    <label>Risk Per Trade (%)</label>
+                    <input type="number" id="riskPerTrade" value="1" min="0.1" max="100" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Daily Trade Limit</label>
+                    <input type="number" id="tradeLimit" value="5" min="1">
+                </div>
+            </div>
             
-            # Summary stats
-            long_signals = len([s for s in all_signals if "LONG" in s["type"]])
-            short_signals = len([s for s in all_signals if "SHORT" in s["type"]])
+            <div class="settings-grid">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="compounding" checked onchange="toggleCompounding()">
+                    <label for="compounding">Enable Compounding</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="withdrawal" checked>
+                    <label for="withdrawal">Enable Monthly Withdrawal (30%)</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="fixedInvestment" onchange="toggleFixedInvestment()">
+                    <label for="fixedInvestment">Fixed Investment Mode</label>
+                </div>
+            </div>
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Active Signals", len(all_signals))
-            with col2:
-                st.metric("Long Signals 🟢", long_signals)
-            with col3:
-                st.metric("Short Signals 🔴", short_signals)
+            <div id="fixedInvestmentPanel" class="fixed-investment-panel">
+                <div class="form-group" style="max-width: 300px;">
+                    <label>Fixed Investment Amount ($)</label>
+                    <input type="number" id="fixedAmount" value="10" min="1" step="0.1">
+                </div>
+            </div>
             
-            st.write("---")
-            
-            # Display each signal with CODE 2 UI but CODE 1 data
-            for signal in all_signals:
-                with st.container():
-                    col1, col2 = st.columns([2, 3])
-                    
-                    with col1:
-                        st.subheader(f"{signal['symbol']} - {signal['type']}")
-                        st.caption(f"🕐 Entry Time: {signal['timestamp']}")
-                        
-                        # Confidence with color coding
-                        confidence_value = int(signal['confidence'].replace('%', ''))
-                        if confidence_value >= 80:
-                            confidence_color = "🟢"
-                        elif confidence_value >= 70:
-                            confidence_color = "🟡"
-                        else:
-                            confidence_color = "🟠"
-                            
-                        st.write(f"**{confidence_color} Confidence:** {signal['confidence']}")
-                        st.write(f"**Status:** {signal['status']}")
-                        st.write(f"**Setup:** {signal['trend']}")
-                        st.write(f"**RSI:** {signal['rsi']}")
-                        st.write(f"**Volume Strength:** {signal['volume_strength']}")
-                        st.write(f"**ATR:** {signal['atr_value']}")
-                    
-                    with col2:
-                        metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
-                        with metrics_col1:
-                            st.metric("Entry", f"${signal['entry']}")
-                        with metrics_col2:
-                            st.metric("Stop Loss", f"${signal['sl']}")
-                        with metrics_col3:
-                            st.metric("Take Profit", f"${signal['tp']}")
-                        with metrics_col4:
-                            st.metric("R:R", signal['rr'])
-                        
-                        st.info(f"📦 **Order Block Zone:** {signal['ob_zone']}")
-                        
-                        # Risk calculation
-                        risk_per_trade = abs(signal['entry'] - signal['sl'])
-                        reward_per_trade = abs(signal['tp'] - signal['entry'])
-                        st.success(f"**Risk:** ${risk_per_trade:.4f} | **Reward:** ${reward_per_trade:.4f}")
-                        
-                        st.success("✅ **CODE 1 CONFIRMED**: Price retested OB + Candle confirmation")
-                    
-                    st.write("---")
-        else:
-            st.warning("⚠️ No OPEN trades found using CODE 1 logic.")
-            st.info("""
-            💡 **CODE 1 Logic Explanation:**
-            - Only shows trades that actually entered after Order Block retest
-            - Confirms with bullish/bearish candle close
-            - Trades are currently ACTIVE in the market
-            - Same accuracy as successful backtests (~70-80%)
-            """)
+            <button class="btn btn-block" id="runBtn" onclick="runStrategy()">🚀 Run Backtest</button>
+        </div>
         
-        if auto_refresh:
-            st.info("🔄 Auto-refreshing in 60 seconds...")
-            time.sleep(60)
-            st.rerun()
+        <div class="summary" id="summary"></div>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('signals')">📡 Open Signals</button>
+            <button class="tab" onclick="showTab('journal')">📖 Trade Journal</button>
+        </div>
+        
+        <div id="signals" class="tab-content active">
+            <div class="content-card">
+                <h2>🔔 Active Trading Signals</h2>
+                <div class="filter-bar">
+                    <label>Filter by Time:</label>
+                    <select id="signalFilter" onchange="filterSignals()">
+                        <option value="all">All Signals</option>
+                        <option value="24h">Last 24 Hours</option>
+                        <option value="48h">Last 48 Hours</option>
+                        <option value="7d">Last 7 Days</option>
+                        <option value="30d">Last 30 Days</option>
+                    </select>
+                    <label>Coin:</label>
+                    <select id="coinFilter" onchange="filterSignals()">
+                        <option value="all">All Coins</option>
+                    </select>
+                </div>
+                <div id="signalsContent"></div>
+            </div>
+        </div>
+        
+        <div id="journal" class="tab-content">
+            <div class="content-card">
+                <h2>📊 Complete Trade History</h2>
+                <div id="journalContent"></div>
+            </div>
+        </div>
+    </div>
     
-    # CODE 1 Logic Explanation
-    with st.expander("🎯 CODE 1 vs CODE 2 - Key Differences"):
-        st.markdown("""
-        ### 🚀 CODE 1 Logic (Now Implemented):
+    <script>
+        let allSignals = [];
         
-        **✅ What Makes It Better:**
-        - **Order Block Retest Wait**: Doesn't signal immediately at BOS
-        - **Candle Confirmation**: Requires bullish/bearish candle close
-        - **Real Entries**: Shows only trades that actually entered
-        - **OPEN Trades Only**: Filters out completed trades
-        - **Higher Accuracy**: ~70-80% win rate
+        function toggleFixedInvestment() {
+            const fixedMode = document.getElementById('fixedInvestment').checked;
+            const panel = document.getElementById('fixedInvestmentPanel');
+            const compounding = document.getElementById('compounding');
+            const withdrawal = document.getElementById('withdrawal');
+            
+            if (fixedMode) {
+                panel.classList.add('active');
+                compounding.checked = false;
+                compounding.disabled = true;
+                withdrawal.checked = false;
+                withdrawal.disabled = true;
+            } else {
+                panel.classList.remove('active');
+                compounding.disabled = false;
+                withdrawal.disabled = false;
+            }
+        }
         
-        **🔍 Signal Generation Flow:**
-        1. BOS Detection → 2. Volume Check → 3. Trend Alignment → 
-        4. Order Block ID → 5. **WAIT FOR RETEST** → 
-        6. **Candle Confirmation** → 7. Signal Generated ✅
+        function toggleCompounding() {
+            const compounding = document.getElementById('compounding').checked;
+            const withdrawal = document.getElementById('withdrawal');
+            
+            if (!compounding) {
+                withdrawal.checked = false;
+            }
+        }
         
-        ### 📊 Comparison:
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+        }
         
-        | Feature | Old CODE 2 | New CODE 1 |
-        |---------|------------|------------|
-        | **Entry Timing** | At BOS | After OB Retest ✅ |
-        | **Confirmation** | None | Candle Pattern ✅ |
-        | **Signal Type** | Potential | Actual Entry ✅ |
-        | **Accuracy** | ~50-60% | ~70-80% ✅ |
-        | **False Signals** | High | Minimal ✅ |
+        function filterSignals() {
+            const timeFilter = document.getElementById('signalFilter').value;
+            const coinFilter = document.getElementById('coinFilter').value;
+            
+            let filtered = allSignals;
+            
+            // Filter by coin
+            if (coinFilter !== 'all') {
+                filtered = filtered.filter(s => s.symbol === coinFilter);
+            }
+            
+            // Filter by time
+            if (timeFilter !== 'all') {
+                const now = new Date();
+                const hours = {
+                    '24h': 24,
+                    '48h': 48,
+                    '7d': 24 * 7,
+                    '30d': 24 * 30
+                }[timeFilter];
+                
+                filtered = filtered.filter(s => {
+                    const signalDate = new Date(s.date);
+                    const diff = (now - signalDate) / (1000 * 60 * 60);
+                    return diff <= hours;
+                });
+            }
+            
+            displaySignals(filtered);
+        }
         
-        ### 💡 Trading with CODE 1 Signals:
-        - These are **real positions** in the market
-        - Entry already confirmed with candle close
-        - Set your SL/TP as shown
-        - Monitor until trade completes
-        - Higher probability of success
-        """)
+        function displaySignals(signals) {
+            if (signals.length === 0) {
+                document.getElementById('signalsContent').innerHTML = '<div class="empty-state"><p>No signals match the filter criteria</p></div>';
+            } else {
+                document.getElementById('signalsContent').innerHTML = signals.map(s => `
+                    <div class="signal-card">
+                        <div class="signal-header">
+                            <span class="signal-type">${s.type} ${s.symbol}</span>
+                            <span style="color: #7f8c8d; font-size: 13px;">${s.date}</span>
+                        </div>
+                        <div class="signal-details">
+                            <div><strong>Entry:</strong> ${s.entry}</div>
+                            <div><strong>Stop Loss:</strong> ${s.sl}</div>
+                            <div><strong>Take Profit:</strong> ${s.tp}</div>
+                            <div><strong>Position Size:</strong> ${s.position_size}</div>
+                            <div><strong>Invested:</strong> ${s.invested}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+        
+        function runStrategy() {
+            const settings = {
+                testing_months: parseInt(document.getElementById('testingMonths').value),
+                initial_capital: parseFloat(document.getElementById('initialCapital').value),
+                risk_per_trade: parseFloat(document.getElementById('riskPerTrade').value) / 100,
+                daily_trade_limit_per_coin: parseInt(document.getElementById('tradeLimit').value),
+                compounding: document.getElementById('compounding').checked,
+                enable_withdrawal: document.getElementById('withdrawal').checked,
+                fixed_investment_mode: document.getElementById('fixedInvestment').checked,
+                fixed_investment_amount: parseFloat(document.getElementById('fixedAmount').value)
+            };
+            
+            document.getElementById('runBtn').disabled = true;
+            document.getElementById('runBtn').textContent = '⏳ Running Backtest...';
+            document.getElementById('summary').innerHTML = '<div class="loading">🔄 Processing historical data...</div>';
+            
+            fetch('/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(settings)
+            }).then(r => r.json()).then(data => {
+                setTimeout(loadData, 3000);
+            });
+        }
+        
+        function loadData() {
+            fetch('/data').then(r => r.json()).then(data => {
+                if (data.is_running) {
+                    setTimeout(loadData, 2000);
+                    return;
+                }
+                
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('runBtn').textContent = '🚀 Run Backtest';
+                
+                // Summary
+                let s = data.summary;
+                if (Object.keys(s).length === 0) {
+                    document.getElementById('summary').innerHTML = '<div class="loading">No data yet. Run the backtest to see results.</div>';
+                } else {
+                    document.getElementById('summary').innerHTML = `
+                        <div class="summary-card">
+                            <h3>Initial Capital</h3>
+                            <p>${s.initial_capital}</p>
+                        </div>
+                        <div class="summary-card ${s.net_profit >= 0 ? 'profit' : 'loss'}">
+                            <h3>Ending Capital</h3>
+                            <p>${s.ending_capital}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Withdrawn</h3>
+                            <p>${s.total_withdrawn}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Invested Volume</h3>
+                            <p>${s.total_invested_volume}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Trades</h3>
+                            <p>${s.total_trades}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Win Rate</h3>
+                            <p>${s.winrate}%</p>
+                        </div>
+                        <div class="summary-card ${s.net_profit >= 0 ? 'profit' : 'loss'}">
+                            <h3>Net Profit</h3>
+                            <p>${s.net_profit}</p>
+                        </div>
+                        <div class="summary-card profit">
+                            <h3>Wins</h3>
+                            <p>${s.wins}</p>
+                        </div>
+                        <div class="summary-card loss">
+                            <h3>Losses</h3>
+                            <p>${s.losses}</p>
+                        </div>
+                    `;
+                }
+                
+                // Store signals and update coin filter
+                allSignals = data.signals;
+                const uniqueCoins = [...new Set(allSignals.map(s => s.symbol))];
+                const coinFilter = document.getElementById('coinFilter');
+                coinFilter.innerHTML = '<option value="all">All Coins</option>' + 
+                    uniqueCoins.map(coin => `<option value="${coin}">${coin}</option>`).join('');
+                
+                // Display filtered signals
+                filterSignals();
+                
+                // Journal
+                if (data.trades.length === 0) {
+                    document.getElementById('journalContent').innerHTML = '<div class="empty-state"><p>No trades recorded yet</p></div>';
+                } else {
+                    document.getElementById('journalContent').innerHTML = `
+                        <div style="overflow-x: auto;">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>#</th>
+                                        <th>Symbol</th>
+                                        <th>Date</th>
+                                        <th>Type</th>
+                                        <th>Entry</th>
+                                        <th>SL</th>
+                                        <th>TP</th>
+                                        <th>Invested</th>
+                                        <th>Result</th>
+                                        <th>PnL</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${data.trades.map((t, i) => `
+                                        <tr>
+                                            <td>${i+1}</td>
+                                            <td><strong>${t.symbol}</strong></td>
+                                            <td>${t.date}</td>
+                                            <td>${t.type}</td>
+                                            <td>${t.entry}</td>
+                                            <td>${t.sl}</td>
+                                            <td>${t.tp}</td>
+                                            <td>${t.invested}</td>
+                                            <td><span class="badge ${t.result.toLowerCase()}">${t.result}</span></td>
+                                            <td style="color: ${t.pnl >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${t.pnl}</td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    `;
+                }
+            });
+        }
+        
+        // Load data on page load
+        loadData();
+    </script>
+</body>
+</html>
+'''
 
-# ==========================================
-# FOOTER INFO
-# ==========================================
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: gray;'>
-    <p>📡 <b>SMC Signal System v3.0</b> - CODE 1 Accuracy + CODE 2 UI</p>
-    <p>🎯 Order Block Confirmed • ⚡ Real Entries • 🔒 High Accuracy</p>
-    <p><i>Best of both worlds: CODE 1 logic with CODE 2 interface</i></p>
-</div>
-""", unsafe_allow_html=True)
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
 
+@app.route('/run', methods=['POST'])
+def run():
+    global config
+    if not is_running:
+        settings = request.get_json()
+        config.update(settings)
+        threading.Thread(target=run_strategy, daemon=True).start()
+    return jsonify({"status": "started"})
+
+@app.route('/data')
+def data():
+    return jsonify({
+        "trades": trades_data,
+        "summary": summary_data,
+        "signals": open_signals,
+        "is_running": is_running
+    })
+
+# ------------------------------
+# MAIN
+# ------------------------------
+if __name__ == "__main__":
+    print("🚀 Starting SMC Strategy Dashboard...")
+    print("📡 Access at: http://127.0.0.1:5000")
+    app.run(debug=True, use_reloader=False)
