@@ -104,7 +104,7 @@ def detect_order_block(df, idx):
     return (ob_candle["high"], ob_candle["low"])
 
 # ------------------------------
-# TRADING LOGIC
+# TRADING LOGIC - FIXED CAPITAL UPDATE
 # ------------------------------
 def run_strategy():
     global trades_data, summary_data, open_signals, is_running
@@ -230,8 +230,12 @@ def run_strategy():
                     if result == "OPEN":
                         open_signals.append(trade)
                     
-                    # Compounding logic
-                    if not config["fixed_investment_mode"]:
+                    # ✅ FIXED: CAPITAL UPDATE FOR BOTH MODES
+                    if config["fixed_investment_mode"]:
+                        # Fixed mode - update capital for tracking profits
+                        capital += pnl
+                    else:
+                        # Normal mode
                         if config["compounding"]:
                             capital += pnl
                         else:
@@ -313,8 +317,12 @@ def run_strategy():
                     if result == "OPEN":
                         open_signals.append(trade)
                     
-                    # Compounding logic
-                    if not config["fixed_investment_mode"]:
+                    # ✅ FIXED: CAPITAL UPDATE FOR BOTH MODES
+                    if config["fixed_investment_mode"]:
+                        # Fixed mode - update capital for tracking profits
+                        capital += pnl
+                    else:
+                        # Normal mode
                         if config["compounding"]:
                             capital += pnl
                         else:
@@ -325,7 +333,7 @@ def run_strategy():
             print(f"Error processing {symbol}: {e}")
             continue
     
-    # Monthly Withdrawal
+    # Monthly Withdrawal (Only for normal mode)
     if config["enable_withdrawal"] and not config["fixed_investment_mode"]:
         df_trades = pd.DataFrame(trades)
         if not df_trades.empty:
