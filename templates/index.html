@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC Strategy Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 SMC Trading Strategy Dashboard</h1>
+            <p class="subtitle">Smart Money Concept Backtesting & Signal Generator</p>
+        </header>
+
+        <div class="settings-panel">
+            <h2 style="margin-bottom: 15px; font-size: 16px;">⚙️ Configuration</h2>
+            <div class="settings-grid">
+                <div class="form-group">
+                    <label>Testing Period (Months)</label>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <select id="testingMonths" onchange="toggleCustomMonth()">
+                            <option value="1">1 Month</option>
+                            <option value="3">3 Months</option>
+                            <option value="6">6 Months</option>
+                            <option value="12">12 Months</option>
+                            <option value="24">24 Months</option>
+                            <option value="custom">Custom Months</option>
+                        </select>
+                        <input type="number" id="customMonths" value="1" min="1" max="60" step="1" 
+                               style="display: none; width: 100px; padding: 8px 12px;" 
+                               placeholder="Months">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Initial Capital ($)</label>
+                    <input type="number" id="initialCapital" value="50" min="1">
+                </div>
+                <div class="form-group">
+                    <label>Risk Per Trade (%)</label>
+                    <input type="number" id="riskPerTrade" value="1" min="0.1" max="100" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Daily Trade Limit</label>
+                    <input type="number" id="tradeLimit" value="5" min="1">
+                </div>
+            </div>
+
+            <div class="settings-grid">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="compounding" checked onchange="toggleCompounding()">
+                    <label for="compounding">Enable Compounding</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="withdrawal" checked>
+                    <label for="withdrawal">Enable Monthly Withdrawal (30%)</label>
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="fixedInvestment" onchange="toggleFixedInvestment()">
+                    <label for="fixedInvestment">Fixed Investment Mode</label>
+                </div>
+            </div>
+
+            <div id="fixedInvestmentPanel" class="fixed-investment-panel">
+                <div class="form-group" style="max-width: 300px;">
+                    <label>Fixed Investment Amount ($)</label>
+                    <input type="number" id="fixedAmount" value="10" min="1" step="0.1">
+                </div>
+            </div>
+
+            <button class="btn btn-block" id="runBtn" onclick="runStrategy()">🚀 Run Backtest</button>
+        </div>
+
+        <div class="summary" id="summary"></div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('performance')">📈 Performance</button>
+            <button class="tab" onclick="showTab('signals')">📡 Open Signals</button>
+            <button class="tab" onclick="showTab('journal')">📖 Trade Journal</button>
+        </div>
+
+        <div id="performance" class="tab-content active">
+            <div class="performance-grid">
+                <div class="performance-section">
+                    <h3>💰 Coin-wise Performance</h3>
+                    <div id="coinPerformance"></div>
+                </div>
+                <div class="performance-section">
+                    <h3>📅 Weekly Performance</h3>
+                    <div id="weeklyPerformance"></div>
+                </div>
+                <div class="performance-section">
+                    <h3>🗓️ Monthly Performance</h3>
+                    <div id="monthlyPerformance"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="signals" class="tab-content">
+            <div class="content-card">
+                <h2>🔔 Active Trading Signals</h2>
+                <div class="filter-bar">
+                    <label>Filter by Time:</label>
+                    <select id="signalFilter" onchange="filterSignals()">
+                        <option value="all">All Signals</option>
+                        <option value="24h">Last 24 Hours</option>
+                        <option value="48h">Last 48 Hours</option>
+                        <option value="7d">Last 7 Days</option>
+                        <option value="30d">Last 30 Days</option>
+                    </select>
+                    <label>Coin:</label>
+                    <select id="coinFilter" onchange="filterSignals()">
+                        <option value="all">All Coins</option>
+                    </select>
+                </div>
+                <div id="signalsContent"></div>
+            </div>
+        </div>
+
+        <div id="journal" class="tab-content">
+            <div class="content-card">
+                <h2>📊 Complete Trade History</h2>
+                <div id="journalContent"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let allSignals = [];
+
+        function toggleCustomMonth() {
+            const testingMonths = document.getElementById('testingMonths');
+            const customMonths = document.getElementById('customMonths');
+            
+            if (testingMonths.value === 'custom') {
+                customMonths.style.display = 'block';
+                customMonths.focus();
+            } else {
+                customMonths.style.display = 'none';
+            }
+        }
+
+        function toggleFixedInvestment() {
+            const fixedMode = document.getElementById('fixedInvestment').checked;
+            const panel = document.getElementById('fixedInvestmentPanel');
+            const compounding = document.getElementById('compounding');
+            const withdrawal = document.getElementById('withdrawal');
+
+            if (fixedMode) {
+                panel.classList.add('active');
+                compounding.checked = false;
+                compounding.disabled = true;
+                withdrawal.checked = false;
+                withdrawal.disabled = true;
+            } else {
+                panel.classList.remove('active');
+                compounding.disabled = false;
+                withdrawal.disabled = false;
+            }
+        }
+
+        function toggleCompounding() {
+            const compounding = document.getElementById('compounding').checked;
+            const withdrawal = document.getElementById('withdrawal');
+
+            if (!compounding) {
+                withdrawal.checked = false;
+            }
+        }
+
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+        }
+
+        function filterSignals() {
+            const timeFilter = document.getElementById('signalFilter').value;
+            const coinFilter = document.getElementById('coinFilter').value;
+
+            let filtered = allSignals;
+
+            // Filter by coin
+            if (coinFilter !== 'all') {
+                filtered = filtered.filter(s => s.symbol === coinFilter);
+            }
+
+            // Filter by time
+            if (timeFilter !== 'all') {
+                const now = new Date();
+                const hours = {
+                    '24h': 24,
+                    '48h': 48,
+                    '7d': 24 * 7,
+                    '30d': 24 * 30
+                }[timeFilter];
+
+                filtered = filtered.filter(s => {
+                    const signalDate = new Date(s.date);
+                    const diff = (now - signalDate) / (1000 * 60 * 60);
+                    return diff <= hours;
+                });
+            }
+
+            displaySignals(filtered);
+        }
+
+        function displaySignals(signals) {
+            const signalsContent = document.getElementById('signalsContent');
+            if (signals.length === 0) {
+                signalsContent.innerHTML = '<div class="empty-state"><p>No signals match the filter criteria</p></div>';
+            } else {
+                signalsContent.innerHTML = signals.map(s => `
+                    <div class="signal-card">
+                        <div class="signal-header">
+                            <span class="signal-type">${s.type} ${s.symbol}</span>
+                            <span style="color: #7f8c8d; font-size: 13px;">${s.date}</span>
+                        </div>
+                        <div class="signal-details">
+                            <div><strong>Entry:</strong> ${s.entry}</div>
+                            <div><strong>Stop Loss:</strong> ${s.sl}</div>
+                            <div><strong>Take Profit:</strong> ${s.tp}</div>
+                            <div><strong>Position Size:</strong> ${s.position_size}</div>
+                            <div><strong>Invested:</strong> ${s.invested}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function displayPerformance(performanceData) {
+            // Coin Performance
+            let coinHtml = '';
+            if (Object.keys(performanceData.coin_performance).length === 0) {
+                coinHtml = '<div class="empty-state"><p>No coin performance data</p></div>';
+            } else {
+                coinHtml = '<table><thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [coin, data] of Object.entries(performanceData.coin_performance)) {
+                    const winRate = data.trades > 0 ? ((data.wins / data.trades) * 100).toFixed(2) : '0.00';
+                    coinHtml += `
+                        <tr>
+                            <td><strong>${coin}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: #27ae60;">${data.wins}</td>
+                            <td style="color: #e74c3c;">${data.losses}</td>
+                            <td>${winRate}%</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                coinHtml += '</tbody></table>';
+            }
+            document.getElementById('coinPerformance').innerHTML = coinHtml;
+
+            // Weekly Performance
+            let weeklyHtml = '';
+            if (Object.keys(performanceData.weekly_performance).length === 0) {
+                weeklyHtml = '<div class="empty-state"><p>No weekly performance data</p></div>';
+            } else {
+                weeklyHtml = '<table><thead><tr><th>Week</th><th>Trades</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [week, data] of Object.entries(performanceData.weekly_performance)) {
+                    weeklyHtml += `
+                        <tr>
+                            <td><strong>${week}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                weeklyHtml += '</tbody></table>';
+            }
+            document.getElementById('weeklyPerformance').innerHTML = weeklyHtml;
+
+            // Monthly Performance
+            let monthlyHtml = '';
+            if (Object.keys(performanceData.monthly_performance).length === 0) {
+                monthlyHtml = '<div class="empty-state"><p>No monthly performance data</p></div>';
+            } else {
+                monthlyHtml = '<table><thead><tr><th>Month</th><th>Trades</th><th>Net Profit</th></tr></thead><tbody>';
+                for (const [month, data] of Object.entries(performanceData.monthly_performance)) {
+                    monthlyHtml += `
+                        <tr>
+                            <td><strong>${month}</strong></td>
+                            <td>${data.trades}</td>
+                            <td style="color: ${data.net_profit >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${data.net_profit.toFixed(2)}</td>
+                        </tr>
+                    `;
+                }
+                monthlyHtml += '</tbody></table>';
+            }
+            document.getElementById('monthlyPerformance').innerHTML = monthlyHtml;
+        }
+
+        function runStrategy() {
+            const testingMonthsSelect = document.getElementById('testingMonths');
+            const customMonthsInput = document.getElementById('customMonths');
+            
+            // Get testing months value
+            let testing_months;
+            if (testingMonthsSelect.value === 'custom') {
+                testing_months = parseInt(customMonthsInput.value);
+            } else {
+                testing_months = parseInt(testingMonthsSelect.value);
+            }
+
+            // Validate testing months
+            if (testing_months < 1 || testing_months > 60) {
+                alert('Please enter a valid testing period between 1 and 60 months.');
+                return;
+            }
+
+            const settings = {
+                testing_months: testing_months,
+                initial_capital: parseFloat(document.getElementById('initialCapital').value),
+                risk_per_trade: parseFloat(document.getElementById('riskPerTrade').value) / 100,
+                daily_trade_limit_per_coin: parseInt(document.getElementById('tradeLimit').value),
+                compounding: document.getElementById('compounding').checked,
+                enable_withdrawal: document.getElementById('withdrawal').checked,
+                fixed_investment_mode: document.getElementById('fixedInvestment').checked,
+                fixed_investment_amount: parseFloat(document.getElementById('fixedAmount').value)
+            };
+
+            console.log('Sending settings:', settings);
+
+            document.getElementById('runBtn').disabled = true;
+            document.getElementById('runBtn').textContent = '⏳ Running Backtest...';
+            document.getElementById('summary').innerHTML = '<div class="loading">🔄 Processing historical data...</div>';
+
+            fetch('/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            }).then(r => r.json()).then(data => {
+                setTimeout(loadData, 3000);
+            }).catch(error => {
+                console.error('Error running backtest:', error);
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('runBtn').textContent = '🚀 Run Backtest';
+                document.getElementById('summary').innerHTML = '<div class="error">❌ Error running backtest. Please try again.</div>';
+            });
+        }
+
+        function loadData() {
+            fetch('/data').then(r => r.json()).then(data => {
+                if (data.is_running) {
+                    setTimeout(loadData, 2000);
+                    return;
+                }
+
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('runBtn').textContent = '🚀 Run Backtest';
+
+                // Summary
+                console.log(data, 'data')
+                let s = data.summary;
+                if (Object.keys(s).length === 0) {
+                    document.getElementById('summary').innerHTML = '<div class="loading">No data yet. Run the backtest to see results.</div>';
+                } else {
+                    document.getElementById('summary').innerHTML = `
+                        <div class="summary-card">
+                            <h3>Initial Capital</h3>
+                            <p>${s.initial_capital}</p>
+                        </div>
+                        <div class="summary-card ${s.net_profit >= 0 ? 'profit' : 'loss'}">
+                            <h3>Ending Capital</h3>
+                            <p>${s.ending_capital}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Withdrawn</h3>
+                            <p>${s.total_withdrawn}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Invested Volume</h3>
+                            <p>${s.total_invested_volume}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Total Trades</h3>
+                            <p>${s.total_trades}</p>
+                        </div>
+                        <div class="summary-card">
+                            <h3>Win Rate</h3>
+                            <p>${s.winrate}%</p>
+                        </div>
+                        <div class="summary-card ${s.net_profit >= 0 ? 'profit' : 'loss'}">
+                            <h3>Net Profit</h3>
+                            <p>${s.net_profit}</p>
+                        </div>
+                        <div class="summary-card profit">
+                            <h3>Wins</h3>
+                            <p>${s.wins}</p>
+                        </div>
+                        <div class="summary-card loss">
+                            <h3>Losses</h3>
+                            <p>${s.losses}</p>
+                        </div>
+                    `;
+                }
+
+                // Display performance data
+                displayPerformance(data.performance);
+
+                // Store signals and update coin filter
+                allSignals = data.signals;
+                const uniqueCoins = [...new Set(allSignals.map(s => s.symbol))];
+                const coinFilter = document.getElementById('coinFilter');
+                coinFilter.innerHTML = '<option value="all">All Coins</option>' +
+                    uniqueCoins.map(coin => `<option value="${coin}">${coin}</option>`).join('');
+
+                // Display filtered signals
+                filterSignals();
+
+                function displayJournalWithInvestment(trades) {
+                    if (trades.length === 0) {
+                        return '<div class="empty-state"><p>No trades recorded yet</p></div>';
+                    }
+
+                    let html = `
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Symbol</th>
+                        <th>Date</th>
+                        <th>Type</th>
+                        <th>Entry</th>
+                        <th>SL</th>
+                        <th>TP</th>
+                        <th>Invested</th>
+                        <th>Cumulative Investment</th>
+                        <th>Result</th>
+                        <th>PnL</th>
+                        <th>Cumulative PnL</th>
+                    </tr>
+                </thead>
+                <tbody>
+    `;
+
+                    let cumulativeInvestment = 0;
+                    let cumulativePnL = 0;
+
+                    trades.forEach((t, i) => {
+                        cumulativeInvestment += parseFloat(t.invested);
+                        cumulativePnL += parseFloat(t.pnl);
+
+                        html += `
+            <tr>
+                <td>${i + 1}</td>
+                <td><strong>${t.symbol}</strong></td>
+                <td>${t.date}</td>
+                <td>${t.type}</td>
+                <td>${t.entry}</td>
+                <td>${t.sl}</td>
+                <td>${t.tp}</td>
+                <td>$${parseFloat(t.invested).toFixed(2)}</td>
+                <td style="font-weight: 600;">$${cumulativeInvestment.toFixed(2)}</td>
+                <td><span class="badge ${t.result.toLowerCase()}">${t.result}</span></td>
+                <td style="color: ${t.pnl >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${parseFloat(t.pnl).toFixed(2)}</td>
+                <td style="color: ${cumulativePnL >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 700;">$${cumulativePnL.toFixed(2)}</td>
+            </tr>
+        `;
+                    });
+
+                    html += `
+                </tbody>
+            </table>
+        </div>
+    `;
+
+                    return html;
+                }
+
+                document.getElementById('journalContent').innerHTML = displayJournalWithInvestment(data.trades);
+            });
+        }
+
+        // Load data on page load
+        loadData();
+    </script>
+</body>
+
+</html>
