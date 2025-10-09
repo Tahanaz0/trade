@@ -424,7 +424,9 @@
                     <tr>
                         <th>#</th>
                         <th>Symbol</th>
-                        <th>Date</th>
+                        <th>Entry Date</th>
+                        <th>Close Date</th>
+                        <th>Duration</th>
                         <th>Type</th>
                         <th>Entry</th>
                         <th>SL</th>
@@ -446,11 +448,30 @@
                         cumulativeInvestment += parseFloat(t.invested);
                         cumulativePnL += parseFloat(t.pnl);
 
+                        // Calculate trade duration
+                        let duration = 'N/A';
+                        if (t.close_date && t.close_date !== 'OPEN') {
+                            const entryDate = new Date(t.date);
+                            const closeDate = new Date(t.close_date);
+                            const diffMs = closeDate - entryDate;
+                            const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+                            const diffDays = Math.floor(diffHours / 24);
+                            const remainingHours = diffHours % 24;
+                            
+                            if (diffDays > 0) {
+                                duration = `${diffDays}d ${remainingHours}h`;
+                            } else {
+                                duration = `${diffHours}h`;
+                            }
+                        }
+
                         html += `
             <tr>
                 <td>${i + 1}</td>
                 <td><strong>${t.symbol}</strong></td>
                 <td>${t.date}</td>
+                <td style="color: ${t.close_date === 'OPEN' ? '#f39c12' : '#2ecc71'};">${t.close_date || 'OPEN'}</td>
+                <td style="font-weight: 600; color: #7f8c8d;">${duration}</td>
                 <td>${t.type}</td>
                 <td>${t.entry}</td>
                 <td>${t.sl}</td>
