@@ -1,5 +1,6 @@
-streamlit
 flask
-ccxt
+gunicorn
 pandas
+ccxt
 pytz
+streamlit
