@@ -16,7 +16,15 @@ class ConfigManager:
             "compounding": True,
             "enable_withdrawal": True,
             "fixed_investment_mode": False,
-            "fixed_investment_amount": 10
+            "fixed_investment_amount": 10,
+            
+
+
+            "min_bos_strength": 0.5,          # Minimum BOS move %
+            "skip_ranging_markets": True,      # Skip ranging conditions
+            "time_filter_enabled": True,       # Enable time filter
+            "dynamic_tp_sl": True,             # Use adaptive TP/SL
+            "min_volume_ratio": 1.2,           # Minimum volume confirmation
         }
     
     def update_config(self, new_settings):

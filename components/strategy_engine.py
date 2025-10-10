@@ -1,5 +1,6 @@
 import threading
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from components.data_fetcher import DataFetcher
 
@@ -11,102 +12,226 @@ class StrategyEngine:
         self.is_running = False
         self.trades_data = []
         self.open_signals = []
-        self.open_positions = []  # Track open positions for concurrent trade limiting
+        self.open_positions = []
     
+    # ✅ IMPROVEMENT 1: Enhanced BOS Detection with Strength Measurement
     def is_bos(self, df, idx):
-        """Detect Break of Structure"""
-        if idx < 3:
-            return None
+        """Detect Break of Structure with strength validation"""
+        if idx < 5:
+            return None, 0
         
         cur = df.iloc[idx]
         prev = df.iloc[idx-1]
         prev2 = df.iloc[idx-2]
         
+        # Bull BOS with strength check
         if cur["high"] > prev["high"] and prev["high"] > prev2["high"]:
-            return "bull"
+            # Calculate BOS strength (percentage move)
+            strength = ((cur["high"] - prev2["high"]) / prev2["high"]) * 100
+            
+            # Require minimum strength and volume confirmation
+            vol_ratio = cur["volume"] / df["volume"].iloc[idx-10:idx].mean()
+            if strength > 0.5 and vol_ratio > 1.2:  # Strong BOS with volume
+                return "bull", strength
+        
+        # Bear BOS with strength check
         if cur["low"] < prev["low"] and prev["low"] < prev2["low"]:
-            return "bear"
+            strength = ((prev2["low"] - cur["low"]) / prev2["low"]) * 100
+            vol_ratio = cur["volume"] / df["volume"].iloc[idx-10:idx].mean()
+            if strength > 0.5 and vol_ratio > 1.2:
+                return "bear", strength
+        
+        return None, 0
+    
+    # ✅ IMPROVEMENT 2: Enhanced Order Block Detection
+    def detect_order_block(self, df, idx, bos_type):
+        """Detect valid order block with better validation"""
+        if idx < 10:
+            return None
+        
+        # Look back for the last bearish candle before bull BOS (or vice versa)
+        lookback = min(10, idx)
+        
+        for i in range(1, lookback):
+            ob_candle = df.iloc[idx - i]
+            
+            if bos_type == "bull":
+                # Find last strong bearish candle
+                if ob_candle["close"] < ob_candle["open"]:
+                    body_size = abs(ob_candle["open"] - ob_candle["close"])
+                    candle_range = ob_candle["high"] - ob_candle["low"]
+                    
+                    # Strong bearish candle (body > 60% of range)
+                    if body_size / candle_range > 0.6:
+                        return (ob_candle["high"], ob_candle["low"], ob_candle["close"])
+            
+            elif bos_type == "bear":
+                # Find last strong bullish candle
+                if ob_candle["close"] > ob_candle["open"]:
+                    body_size = abs(ob_candle["close"] - ob_candle["open"])
+                    candle_range = ob_candle["high"] - ob_candle["low"]
+                    
+                    if body_size / candle_range > 0.6:
+                        return (ob_candle["high"], ob_candle["low"], ob_candle["close"])
+        
         return None
     
-    def detect_order_block(self, df, idx):
-        """Detect order block"""
-        if idx - 1 < 0:
-            return None
-        ob_candle = df.iloc[idx-1]
-        return (ob_candle["high"], ob_candle["low"])
+    # ✅ IMPROVEMENT 3: Market Regime Filter
+    def get_market_regime(self, df, idx):
+        """Determine if market is trending or ranging"""
+        if idx < 50:
+            return "unknown"
+        
+        recent_data = df.iloc[idx-50:idx]
+        
+        # Calculate ADX-like trend strength
+        ema_fast = recent_data["close"].ewm(span=20).mean()
+        ema_slow = recent_data["close"].ewm(span=50).mean()
+        
+        price_range = recent_data["high"].max() - recent_data["low"].min()
+        avg_price = recent_data["close"].mean()
+        volatility = (price_range / avg_price) * 100
+        
+        # Strong trend if EMAs clearly separated
+        ema_separation = abs(ema_fast.iloc[-1] - ema_slow.iloc[-1]) / ema_slow.iloc[-1] * 100
+        
+        if ema_separation > 2 and volatility > 5:
+            return "trending"
+        elif volatility < 3:
+            return "ranging"
+        else:
+            return "transitioning"
+    
+    # ✅ IMPROVEMENT 4: Dynamic TP/SL based on volatility
+    def calculate_dynamic_tp_sl(self, df, idx, atr, risk_per_unit, config):
+        """Calculate adaptive TP/SL ratios based on market conditions"""
+        market_regime = self.get_market_regime(df, idx)
+        
+        # Base multipliers
+        tp_multiplier = config["tp_rr"]
+        sl_multiplier = config["atr_sl_multiplier"]
+        
+        # Adjust based on market regime
+        if market_regime == "trending":
+            tp_multiplier *= 1.3  # Ride trends longer
+            sl_multiplier *= 0.9  # Tighter stops
+        elif market_regime == "ranging":
+            tp_multiplier *= 0.8  # Quick profits in ranging
+            sl_multiplier *= 1.1  # Wider stops for noise
+        
+        # Check recent volatility
+        recent_atr = df["ATR14"].iloc[idx-10:idx].mean()
+        current_atr = atr
+        
+        if current_atr > recent_atr * 1.5:  # High volatility spike
+            sl_multiplier *= 1.2  # Wider stops
+        
+        return tp_multiplier, sl_multiplier
+    
+    # ✅ IMPROVEMENT 5: Time-based filter
+    def is_valid_trading_time(self, timestamp):
+        """Filter out low-liquidity hours"""
+        hour = timestamp.hour
+        
+        # Avoid low liquidity times (example: midnight to 4 AM UTC)
+        # Adjust based on your market observations
+        if 0 <= hour < 4:
+            return False
+        
+        return True
+    
+    # ✅ IMPROVEMENT 6: Multi-timeframe confirmation
+    def check_higher_timeframe_alignment(self, symbol, timeframe, direction):
+        """Check if higher timeframe supports the trade direction"""
+        # This is a placeholder - you'd need to fetch higher TF data
+        # For now, returning True. Implement if you want HTF confirmation
+        return True
     
     def can_open_new_trade(self, config, signal_timestamp, symbol):
-        """
-        ✅ Check if we can open a new trade based on:
-        1. Total concurrent position limit
-        2. Per-coin position limit (only 1 trade per coin at a time)
-        """
+        """Check if we can open a new trade"""
         if not config["fixed_investment_mode"]:
             return True
         
-        # Calculate max concurrent trades based on capital and fixed investment
         max_concurrent_trades = int(config["initial_capital"] / config["fixed_investment_amount"])
         
-        # Count positions that are still open at signal_timestamp
         open_positions_at_time = [
             pos for pos in self.open_positions
             if pos['entry_timestamp'] <= signal_timestamp < pos['close_timestamp']
         ]
         
-        # ✅ Check 1: Total concurrent limit
         if len(open_positions_at_time) >= max_concurrent_trades:
-            print(f"   ⚠️ Max concurrent positions reached ({len(open_positions_at_time)}/{max_concurrent_trades}). Skipping new trade.")
             return False
         
-        # ✅ Check 2: Per-coin limit (only 1 trade per coin)
         for pos in open_positions_at_time:
             if pos['symbol'] == symbol:
-                print(f"   ⚠️ {symbol} already has an open position. Skipping new trade.")
                 return False
         
         return True
     
     def process_long_entry(self, df, i, symbol, capital, daily_trades, config):
-        """Process long entry signal"""
+        """Process long entry with enhanced filters"""
         candle = df.iloc[i]
         date = candle.name.date()
         signal_timestamp = candle.name.timestamp()
         
-        # ✅ Check daily trade limit per coin
+        # Daily trade limit check
         if daily_trades.get(date, 0) >= config["daily_trade_limit_per_coin"]:
             return None, capital
         
-        # ✅ Check concurrent position limit (total + per-coin)
+        # Concurrent position check
         if not self.can_open_new_trade(config, signal_timestamp, symbol):
+            return None, capital
+        
+        # ✅ Time filter
+        if not self.is_valid_trading_time(candle.name):
             return None, capital
         
         atr = candle["ATR14"]
         vol_avg = df["VOL_AVG14"].iloc[i]
         
-        if pd.isna(atr) or pd.isna(vol_avg) or candle["volume"] < config["volume_multiplier"] * vol_avg:
+        if pd.isna(atr) or pd.isna(vol_avg):
             return None, capital
         
-        bos = self.is_bos(df, i)
-        if bos != "bull" or candle["EMA50"] <= candle["EMA200"]:
+        # ✅ Enhanced BOS check with strength
+        bos, bos_strength = self.is_bos(df, i)
+        if bos != "bull" or bos_strength < 0.5:
             return None, capital
         
-        ob = self.detect_order_block(df, i)
+        # EMA trend filter
+        if candle["EMA50"] <= candle["EMA200"]:
+            return None, capital
+        
+        # ✅ Market regime filter
+        regime = self.get_market_regime(df, i)
+        if regime == "ranging":
+            return None, capital  # Skip ranging markets for trend strategy
+        
+        # ✅ Enhanced volume check
+        vol_ratio = candle["volume"] / vol_avg
+        if vol_ratio < config["volume_multiplier"]:
+            return None, capital
+        
+        # ✅ Enhanced order block detection
+        ob = self.detect_order_block(df, i, "bull")
         if ob is None:
             return None, capital
         
-        ob_high, ob_low = ob
+        ob_high, ob_low, ob_close = ob
         entry_idx = None
         
-        # Find entry point
+        # Find entry point with better validation
         for j in range(i+1, min(i+1+config["max_lookforward_bars"], len(df))):
             fc = df.iloc[j]
+            
+            # Price touches order block zone
             if fc["low"] <= ob_high + (atr * 0.25) and fc["high"] >= ob_low - (atr * 0.25):
-                if fc["close"] > fc["open"]:
+                # Wait for bullish confirmation
+                if fc["close"] > fc["open"] and fc["close"] > ob_close:
                     entry_idx = j
                     break
                 if j+1 < len(df):
                     nc = df.iloc[j+1]
-                    if nc["close"] > nc["open"]:
+                    if nc["close"] > nc["open"] and nc["close"] > ob_close:
                         entry_idx = j+1
                         break
         
@@ -116,46 +241,63 @@ class StrategyEngine:
         return self.execute_trade(df, entry_idx, symbol, "LONG", ob_low, atr, capital, config, daily_trades, date)
     
     def process_short_entry(self, df, i, symbol, capital, daily_trades, config):
-        """Process short entry signal"""
+        """Process short entry with enhanced filters"""
         candle = df.iloc[i]
         date = candle.name.date()
         signal_timestamp = candle.name.timestamp()
         
-        # ✅ Check daily trade limit per coin
         if daily_trades.get(date, 0) >= config["daily_trade_limit_per_coin"]:
             return None, capital
         
-        # ✅ Check concurrent position limit (total + per-coin)
         if not self.can_open_new_trade(config, signal_timestamp, symbol):
+            return None, capital
+        
+        # ✅ Time filter
+        if not self.is_valid_trading_time(candle.name):
             return None, capital
         
         atr = candle["ATR14"]
         vol_avg = df["VOL_AVG14"].iloc[i]
         
-        if pd.isna(atr) or pd.isna(vol_avg) or candle["volume"] < config["volume_multiplier"] * vol_avg:
+        if pd.isna(atr) or pd.isna(vol_avg):
             return None, capital
         
-        bos = self.is_bos(df, i)
-        if bos != "bear" or candle["EMA50"] >= candle["EMA200"]:
+        # ✅ Enhanced BOS check
+        bos, bos_strength = self.is_bos(df, i)
+        if bos != "bear" or bos_strength < 0.5:
             return None, capital
         
-        ob = self.detect_order_block(df, i)
+        if candle["EMA50"] >= candle["EMA200"]:
+            return None, capital
+        
+        # ✅ Market regime filter
+        regime = self.get_market_regime(df, i)
+        if regime == "ranging":
+            return None, capital
+        
+        # ✅ Enhanced volume check
+        vol_ratio = candle["volume"] / vol_avg
+        if vol_ratio < config["volume_multiplier"]:
+            return None, capital
+        
+        # ✅ Enhanced order block detection
+        ob = self.detect_order_block(df, i, "bear")
         if ob is None:
             return None, capital
         
-        ob_high, ob_low = ob
+        ob_high, ob_low, ob_close = ob
         entry_idx = None
         
-        # Find entry point
         for j in range(i+1, min(i+1+config["max_lookforward_bars"], len(df))):
             fc = df.iloc[j]
+            
             if fc["high"] >= ob_low - (atr * 0.25) and fc["low"] <= ob_high + (atr * 0.25):
-                if fc["close"] < fc["open"]:
+                if fc["close"] < fc["open"] and fc["close"] < ob_close:
                     entry_idx = j
                     break
                 if j+1 < len(df):
                     nc = df.iloc[j+1]
-                    if nc["close"] < nc["open"]:
+                    if nc["close"] < nc["open"] and nc["close"] < ob_close:
                         entry_idx = j+1
                         break
         
@@ -165,56 +307,51 @@ class StrategyEngine:
         return self.execute_trade(df, entry_idx, symbol, "SHORT", ob_high, atr, capital, config, daily_trades, date)
     
     def execute_trade(self, df, entry_idx, symbol, trade_type, ob_level, atr, capital, config, daily_trades, date):
-        """Execute a trade and calculate results"""
+        """Execute trade with dynamic TP/SL"""
         entry_row = df.iloc[entry_idx]
         entry_price = entry_row["close"]
         entry_timestamp = entry_row.name.timestamp()
         
-        # Calculate SL and position size
+        # ✅ Get dynamic TP/SL multipliers
+        tp_mult, sl_mult = self.calculate_dynamic_tp_sl(df, entry_idx, atr, 0, config)
+        
+        # Calculate SL
         if trade_type == "LONG":
-            sl_price = min(ob_level - atr * 0.1, entry_price - atr * config["atr_sl_multiplier"])
+            sl_price = min(ob_level - atr * 0.1, entry_price - atr * sl_mult)
             risk_per_unit = abs(entry_price - sl_price)
         else:
-            sl_price = max(ob_level + atr * 0.1, entry_price + atr * config["atr_sl_multiplier"])
+            sl_price = max(ob_level + atr * 0.1, entry_price + atr * sl_mult)
             risk_per_unit = abs(sl_price - entry_price)
         
-        # Position sizing logic
+        # Position sizing
         if config["fixed_investment_mode"]:
             invested = config["fixed_investment_amount"]
             position_size_units = invested / entry_price
         else:
             risk_amount = capital * config["risk_per_trade"]
-
             if risk_per_unit <= 0:
-                print(f"❌ Invalid risk per unit for {symbol}: {risk_per_unit}")
                 return None, capital
-
             position_size_units = risk_amount / risk_per_unit
             invested = position_size_units * entry_price
-
             if invested > capital:
-                print(f"   ⚠️ Adjusting: Invested (${invested:.2f}) > Capital (${capital:.2f})")
                 scale_factor = capital / invested
                 position_size_units *= scale_factor
                 invested = capital
         
-        # Calculate TP
+        # ✅ Calculate dynamic TP
         if trade_type == "LONG":
-            tp_price = entry_price + (risk_per_unit * config["tp_rr"])
+            tp_price = entry_price + (risk_per_unit * tp_mult)
         else:
-            tp_price = entry_price - (risk_per_unit * config["tp_rr"])
+            tp_price = entry_price - (risk_per_unit * tp_mult)
         
-        # Check trade outcome
         result, pnl, close_idx = self.check_trade_outcome(df, entry_idx, trade_type, sl_price, tp_price, 
                                              position_size_units, entry_price, config)
         
-        # ✅ Track open position for concurrent limit
+        # Track position
         if config["fixed_investment_mode"]:
             if close_idx is not None:
                 close_timestamp = df.iloc[close_idx].name.timestamp()
             else:
-                # ✅ For OPEN trades, use the last available timestamp in the dataframe
-                # This ensures they only block concurrent trades during their actual timeframe
                 close_timestamp = df.iloc[-1].name.timestamp()
             
             self.open_positions.append({
@@ -224,7 +361,7 @@ class StrategyEngine:
                 'invested': invested
             })
         
-        # Capital Update Logic
+        # Capital update
         if config["fixed_investment_mode"]:
             capital += pnl
         else:
@@ -252,25 +389,16 @@ class StrategyEngine:
             "timestamp": entry_timestamp
         }
         
-        # Count current open positions
-        current_open = sum(
-            1 for pos in self.open_positions
-            if pos['entry_timestamp'] <= entry_timestamp < pos['close_timestamp']
-        )
-        
-        print(f"✅ Trade: {symbol} {trade_type} | Open Positions: {current_open} | Invested: ${invested:.2f} | PnL: ${pnl:.4f}")
-        
         daily_trades[date] = daily_trades.get(date, 0) + 1
         
         return trade, capital
-
+    
     def check_trade_outcome(self, df, entry_idx, trade_type, sl_price, tp_price, position_size, entry_price, config):
-        """Check if trade hits SL or TP"""
+        """Check trade outcome"""
         result = "OPEN"
         pnl = 0.0
         close_idx = None
         
-        # Check from entry to end of dataframe (not just max_lookforward_bars)
         for k in range(entry_idx+1, len(df)):
             sc = df.iloc[k]
             
@@ -297,22 +425,17 @@ class StrategyEngine:
                     close_idx = k
                     break
         
-        # If still open after checking all data, mark as OPEN with current unrealized PnL
         if result == "OPEN" and len(df) > entry_idx:
-            last_candle = df.iloc[-1]
-            last_price = last_candle["close"]
-            
+            last_price = df.iloc[-1]["close"]
             if trade_type == "LONG":
-                # Calculate unrealized PnL for open long position
                 pnl = position_size * (last_price - entry_price)
             else:
-                # Calculate unrealized PnL for open short position
                 pnl = position_size * (entry_price - last_price)
         
         return result, pnl, close_idx
     
     def run_strategy(self):
-        """Main strategy execution method - processes all signals chronologically"""
+        """Main strategy execution"""
         self.is_running = True
         self.trades_data = []
         self.open_signals = []
@@ -325,24 +448,13 @@ class StrategyEngine:
         total_invested_volume = 0.0
         days = config["testing_months"] * 30
         
-        print(f"🚀 Starting backtest with {len(config['coins'])} coins for {days} days")
+        print(f"🚀 Starting Enhanced Backtest")
         print(f"📊 Initial Capital: ${capital}")
-        print(f"📈 Compounding: {config['compounding']}")
-        print(f"🎯 Risk per Trade: {config['risk_per_trade'] * 100}%")
+        print(f"🎯 Dynamic TP/SL: Enabled")
+        print(f"🔍 Market Regime Filter: Active")
+        print(f"⏰ Time Filter: Active")
         
-        if config["fixed_investment_mode"]:
-            max_concurrent = int(config["initial_capital"] / config["fixed_investment_amount"])
-            print(f"💰 Fixed Investment Mode: ${config['fixed_investment_amount']} per trade")
-            print(f"🔢 Max Concurrent Positions: {max_concurrent}")
-            print(f"🔒 Per-Coin Limit: 1 trade at a time")
-        
-        print(f"💵 Withdrawal Enabled: {config['enable_withdrawal']}")
-        if config['enable_withdrawal']:
-            print(f"📤 Withdraw %: {config['withdraw_percentage'] * 100}%")
-            print(f"🔄 Reinvest %: {config['reinvest_percentage'] * 100}%")
-        
-        # ✅ Step 1: Collect all potential signals from all coins
-        print("\n🔍 Collecting signals from all coins...")
+        # Collect signals
         all_potential_signals = []
         
         for symbol in config["coins"]:
@@ -350,45 +462,44 @@ class StrategyEngine:
             try:
                 df = self.data_fetcher.fetch_ohlcv(symbol, config["timeframe"], days=days)
                 if df.empty:
-                    print(f"   ❌ No data for {symbol}")
                     continue
                     
                 df = self.data_fetcher.add_indicators(df)
                 
-                for i in range(2, len(df)-1):
+                for i in range(10, len(df)-1):  # Start from 10 for better indicators
                     candle = df.iloc[i]
                     signal_timestamp = candle.name.timestamp()
                     
-                    # Check for potential long signal
-                    if self.is_bos(df, i) == "bull" and candle["EMA50"] > candle["EMA200"]:
+                    bos, strength = self.is_bos(df, i)
+                    
+                    if bos == "bull" and candle["EMA50"] > candle["EMA200"]:
                         all_potential_signals.append({
                             'symbol': symbol,
                             'timestamp': signal_timestamp,
                             'df': df,
                             'index': i,
-                            'type': 'LONG'
+                            'type': 'LONG',
+                            'strength': strength
                         })
                     
-                    # Check for potential short signal
-                    if self.is_bos(df, i) == "bear" and candle["EMA50"] < candle["EMA200"]:
+                    if bos == "bear" and candle["EMA50"] < candle["EMA200"]:
                         all_potential_signals.append({
                             'symbol': symbol,
                             'timestamp': signal_timestamp,
                             'df': df,
                             'index': i,
-                            'type': 'SHORT'
+                            'type': 'SHORT',
+                            'strength': strength
                         })
                         
             except Exception as e:
-                print(f"   ❌ Error processing {symbol}: {e}")
+                print(f"   ❌ Error: {e}")
                 continue
         
-        # ✅ Step 2: Sort all signals chronologically
         all_potential_signals.sort(key=lambda x: x['timestamp'])
-        print(f"\n📊 Found {len(all_potential_signals)} potential signals across all coins")
+        print(f"\n📊 Found {len(all_potential_signals)} signals")
         
-        # ✅ Step 3: Process signals in chronological order
-        print("\n🔄 Processing signals chronologically...\n")
+        # Process signals
         monthly_data = {}
         daily_trades_tracker = {}
         
@@ -398,19 +509,14 @@ class StrategyEngine:
             i = signal['index']
             signal_type = signal['type']
             
-            # Get daily trades for this symbol
             if symbol not in daily_trades_tracker:
                 daily_trades_tracker[symbol] = {}
             
             trade = None
             if signal_type == 'LONG':
-                trade, capital = self.process_long_entry(
-                    df, i, symbol, capital, daily_trades_tracker[symbol], config
-                )
+                trade, capital = self.process_long_entry(df, i, symbol, capital, daily_trades_tracker[symbol], config)
             else:
-                trade, capital = self.process_short_entry(
-                    df, i, symbol, capital, daily_trades_tracker[symbol], config
-                )
+                trade, capital = self.process_short_entry(df, i, symbol, capital, daily_trades_tracker[symbol], config)
             
             if trade:
                 self.trades_data.append(trade)
@@ -426,54 +532,36 @@ class StrategyEngine:
                 if trade["result"] == "OPEN":
                     self.open_signals.append(trade)
         
-        print(f"\n📊 Processed {len(self.trades_data)} trades chronologically")
-        
-        # Monthly Withdrawal Logic
+        # Withdrawal logic
         if config["enable_withdrawal"] and not config["fixed_investment_mode"]:
-            print(f"\n💰 Processing Monthly Withdrawals...")
-            
-            if monthly_data:
-                for month, data in monthly_data.items():
-                    monthly_profit = data["profit"]
-                    if monthly_profit > 0:
-                        withdraw_amount = monthly_profit * config["withdraw_percentage"]
-                        reinvest_amount = monthly_profit * config["reinvest_percentage"]
-                        
-                        expected_total = withdraw_amount + reinvest_amount
-                        if abs(expected_total - monthly_profit) > 0.01:
-                            reinvest_amount = monthly_profit - withdraw_amount
-                        
-                        total_withdrawn += withdraw_amount
-                        
-                        if config["compounding"]:
-                            capital += reinvest_amount
-                        
-                        print(f"📅 Month {month}: Withdrawn ${withdraw_amount:.2f}, Reinvested ${reinvest_amount:.2f}")
+            for month, data in monthly_data.items():
+                if data["profit"] > 0:
+                    withdraw = data["profit"] * config["withdraw_percentage"]
+                    reinvest = data["profit"] * config["reinvest_percentage"]
+                    total_withdrawn += withdraw
+                    if config["compounding"]:
+                        capital += reinvest
         
-        # Final capital calculation for non-compounding mode
         if not config["compounding"] and not config["fixed_investment_mode"]:
-            total_pnl = sum(trade["pnl"] for trade in self.trades_data)
+            total_pnl = sum(t["pnl"] for t in self.trades_data)
             capital = config["initial_capital"] + total_pnl
         
-        # Calculate final summary
         summary = self.calculate_summary(config, capital, total_withdrawn, total_invested_volume)
         self.performance_tracker.set_summary(summary)
         
-        print(f"\n🎯 Backtest Completed!")
-        print(f"📊 Total Trades: {len(self.trades_data)}")
+        print(f"\n✅ Backtest Complete!")
         print(f"💰 Final Capital: ${capital:.2f}")
-        print(f"💵 Total Withdrawn: ${total_withdrawn:.2f}")
-        print(f"💸 Net Profit: ${summary['net_profit']:.2f}")
-        print(f"🏆 Win Rate: {summary['winrate']}%")
+        print(f"📈 Net Profit: ${summary['net_profit']:.2f}")
+        print(f"🎯 Win Rate: {summary['winrate']}%")
         
         self.is_running = False
     
     def calculate_summary(self, config, capital, total_withdrawn, total_invested_volume):
-        """Calculate performance summary"""
+        """Calculate summary"""
         wins = sum(1 for t in self.trades_data if t["result"] == "WIN")
         losses = sum(1 for t in self.trades_data if t["result"] == "LOSS")
-        total_trades = wins + losses
-        winrate = (wins / total_trades * 100) if total_trades > 0 else 0
+        total = wins + losses
+        winrate = (wins / total * 100) if total > 0 else 0
         net_profit = (capital + total_withdrawn) - config["initial_capital"]
         
         return {
@@ -481,7 +569,7 @@ class StrategyEngine:
             "ending_capital": round(capital, 2),
             "total_withdrawn": round(total_withdrawn, 2),
             "total_invested_volume": round(total_invested_volume, 2),
-            "total_trades": total_trades,
+            "total_trades": total,
             "wins": wins,
             "losses": losses,
             "winrate": round(winrate, 2),
@@ -489,21 +577,15 @@ class StrategyEngine:
         }
     
     def start_backtest(self):
-        """Start backtest in separate thread"""
+        """Start backtest"""
         if not self.is_running:
-            print("🎬 Starting backtest in separate thread...")
             threading.Thread(target=self.run_strategy, daemon=True).start()
-        else:
-            print("⏳ Backtest is already running...")
     
     def get_trades_data(self):
-        """Get trades data sorted by date"""
         return self.trades_data
     
     def get_open_signals(self):
-        """Get open signals"""
         return self.open_signals
     
     def get_running_status(self):
-        """Get running status"""
         return self.is_running
