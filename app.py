@@ -971,10 +971,9 @@ def data():
     })
 
 # ------------------------------
-# MAIN
+# MAIN - Railway Deployment Fix
 # ------------------------------
-import os
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))   # Railway ka PORT use karega
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Starting SMC Strategy Dashboard on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
