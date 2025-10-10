@@ -11,7 +11,7 @@ class StrategyEngine:
         self.is_running = False
         self.trades_data = []
         self.open_signals = []
-        self.open_positions = []  # ✅ NEW: Track open positions for concurrent trade limiting
+        self.open_positions = []  # Track open positions for concurrent trade limiting
     
     def is_bos(self, df, idx):
         """Detect Break of Structure"""
@@ -35,9 +35,11 @@ class StrategyEngine:
         ob_candle = df.iloc[idx-1]
         return (ob_candle["high"], ob_candle["low"])
     
-    def can_open_new_trade(self, config, current_index, df):
+    def can_open_new_trade(self, config, signal_timestamp, symbol):
         """
-        ✅ NEW: Check if we can open a new trade based on concurrent position limits
+        ✅ Check if we can open a new trade based on:
+        1. Total concurrent position limit
+        2. Per-coin position limit (only 1 trade per coin at a time)
         """
         if not config["fixed_investment_mode"]:
             return True
@@ -45,19 +47,22 @@ class StrategyEngine:
         # Calculate max concurrent trades based on capital and fixed investment
         max_concurrent_trades = int(config["initial_capital"] / config["fixed_investment_amount"])
         
-        # Close positions that have reached SL/TP by current index
-        current_timestamp = df.iloc[current_index].name.timestamp()
-        
-        # Update open positions - remove closed ones
-        self.open_positions = [
-            pos for pos in self.open_positions 
-            if pos['close_timestamp'] > current_timestamp
+        # Count positions that are still open at signal_timestamp
+        open_positions_at_time = [
+            pos for pos in self.open_positions
+            if pos['entry_timestamp'] <= signal_timestamp < pos['close_timestamp']
         ]
         
-        current_open = len(self.open_positions)
-        
-        if current_open >= max_concurrent_trades:
+        # ✅ Check 1: Total concurrent limit
+        if len(open_positions_at_time) >= max_concurrent_trades:
+            print(f"   ⚠️ Max concurrent positions reached ({len(open_positions_at_time)}/{max_concurrent_trades}). Skipping new trade.")
             return False
+        
+        # ✅ Check 2: Per-coin limit (only 1 trade per coin)
+        for pos in open_positions_at_time:
+            if pos['symbol'] == symbol:
+                print(f"   ⚠️ {symbol} already has an open position. Skipping new trade.")
+                return False
         
         return True
     
@@ -65,14 +70,14 @@ class StrategyEngine:
         """Process long entry signal"""
         candle = df.iloc[i]
         date = candle.name.date()
+        signal_timestamp = candle.name.timestamp()
         
         # ✅ Check daily trade limit per coin
         if daily_trades.get(date, 0) >= config["daily_trade_limit_per_coin"]:
             return None, capital
         
-        # ✅ NEW: Check concurrent position limit (for fixed investment mode)
-        if not self.can_open_new_trade(config, i, df):
-            print(f"   ⚠️ Max concurrent positions reached ({len(self.open_positions)}). Skipping new trade.")
+        # ✅ Check concurrent position limit (total + per-coin)
+        if not self.can_open_new_trade(config, signal_timestamp, symbol):
             return None, capital
         
         atr = candle["ATR14"]
@@ -114,14 +119,14 @@ class StrategyEngine:
         """Process short entry signal"""
         candle = df.iloc[i]
         date = candle.name.date()
+        signal_timestamp = candle.name.timestamp()
         
         # ✅ Check daily trade limit per coin
         if daily_trades.get(date, 0) >= config["daily_trade_limit_per_coin"]:
             return None, capital
         
-        # ✅ NEW: Check concurrent position limit (for fixed investment mode)
-        if not self.can_open_new_trade(config, i, df):
-            print(f"   ⚠️ Max concurrent positions reached ({len(self.open_positions)}). Skipping new trade.")
+        # ✅ Check concurrent position limit (total + per-coin)
+        if not self.can_open_new_trade(config, signal_timestamp, symbol):
             return None, capital
         
         atr = candle["ATR14"]
@@ -163,6 +168,7 @@ class StrategyEngine:
         """Execute a trade and calculate results"""
         entry_row = df.iloc[entry_idx]
         entry_price = entry_row["close"]
+        entry_timestamp = entry_row.name.timestamp()
         
         # Calculate SL and position size
         if trade_type == "LONG":
@@ -202,12 +208,17 @@ class StrategyEngine:
         result, pnl, close_idx = self.check_trade_outcome(df, entry_idx, trade_type, sl_price, tp_price, 
                                              position_size_units, entry_price, config)
         
-        # ✅ NEW: Track open position for concurrent limit
-        if config["fixed_investment_mode"] and close_idx is not None:
-            close_timestamp = df.iloc[close_idx].name.timestamp()
+        # ✅ Track open position for concurrent limit
+        if config["fixed_investment_mode"]:
+            if close_idx is not None:
+                close_timestamp = df.iloc[close_idx].name.timestamp()
+            else:
+                # If trade is still open, set close_timestamp to far future
+                close_timestamp = float('inf')
+            
             self.open_positions.append({
                 'symbol': symbol,
-                'entry_timestamp': entry_row.name.timestamp(),
+                'entry_timestamp': entry_timestamp,
                 'close_timestamp': close_timestamp,
                 'invested': invested
             })
@@ -237,10 +248,16 @@ class StrategyEngine:
             "pnl": round(pnl, 8),
             "raw_date": trade_date,
             "raw_close_date": close_date,
-            "timestamp": trade_date.timestamp()
+            "timestamp": entry_timestamp
         }
         
-        print(f"✅ Trade: {symbol} {trade_type} | Open Positions: {len(self.open_positions)} | Invested: ${invested:.2f} | PnL: ${pnl:.4f}")
+        # Count current open positions
+        current_open = sum(
+            1 for pos in self.open_positions
+            if pos['entry_timestamp'] <= entry_timestamp < pos['close_timestamp']
+        )
+        
+        print(f"✅ Trade: {symbol} {trade_type} | Open Positions: {current_open} | Invested: ${invested:.2f} | PnL: ${pnl:.4f}")
         
         daily_trades[date] = daily_trades.get(date, 0) + 1
         
@@ -281,11 +298,11 @@ class StrategyEngine:
         return result, pnl, close_idx
     
     def run_strategy(self):
-        """Main strategy execution method"""
+        """Main strategy execution method - processes all signals chronologically"""
         self.is_running = True
         self.trades_data = []
         self.open_signals = []
-        self.open_positions = []  # ✅ Reset open positions
+        self.open_positions = []
         self.performance_tracker.reset()
         
         config = self.config_manager.get_config()
@@ -303,83 +320,99 @@ class StrategyEngine:
             max_concurrent = int(config["initial_capital"] / config["fixed_investment_amount"])
             print(f"💰 Fixed Investment Mode: ${config['fixed_investment_amount']} per trade")
             print(f"🔢 Max Concurrent Positions: {max_concurrent}")
+            print(f"🔒 Per-Coin Limit: 1 trade at a time")
         
         print(f"💵 Withdrawal Enabled: {config['enable_withdrawal']}")
         if config['enable_withdrawal']:
             print(f"📤 Withdraw %: {config['withdraw_percentage'] * 100}%")
             print(f"🔄 Reinvest %: {config['reinvest_percentage'] * 100}%")
         
-        monthly_data = {}
-        all_trades = []
+        # ✅ Step 1: Collect all potential signals from all coins
+        print("\n🔍 Collecting signals from all coins...")
+        all_potential_signals = []
         
         for symbol in config["coins"]:
-            print(f"\n🔍 Processing {symbol} ...")
+            print(f"   Processing {symbol}...")
             try:
                 df = self.data_fetcher.fetch_ohlcv(symbol, config["timeframe"], days=days)
                 if df.empty:
-                    print(f"❌ No data for {symbol}")
+                    print(f"   ❌ No data for {symbol}")
                     continue
                     
                 df = self.data_fetcher.add_indicators(df)
-                print(f"📈 Loaded {len(df)} candles for {symbol}")
-                
-                daily_trades = {}
-                trades_for_symbol = 0
                 
                 for i in range(2, len(df)-1):
-                    trade = None
+                    candle = df.iloc[i]
+                    signal_timestamp = candle.name.timestamp()
                     
-                    # Check for long entries
-                    trade, capital = self.process_long_entry(df, i, symbol, capital, daily_trades, config)
-                    if trade:
-                        all_trades.append(trade)
-                        total_invested_volume += trade["invested"]
-                        self.performance_tracker.update_performance(trade)
-                        
-                        month_key = trade['raw_date'].strftime('%Y-%m')
-                        if month_key not in monthly_data:
-                            monthly_data[month_key] = {"profit": 0.0, "trades": 0}
-                        monthly_data[month_key]["profit"] += trade['pnl']
-                        monthly_data[month_key]["trades"] += 1
-                        
-                        if trade["result"] == "OPEN":
-                            self.open_signals.append(trade)
-                        trades_for_symbol += 1
-                        continue
+                    # Check for potential long signal
+                    if self.is_bos(df, i) == "bull" and candle["EMA50"] > candle["EMA200"]:
+                        all_potential_signals.append({
+                            'symbol': symbol,
+                            'timestamp': signal_timestamp,
+                            'df': df,
+                            'index': i,
+                            'type': 'LONG'
+                        })
                     
-                    # Check for short entries
-                    trade, capital = self.process_short_entry(df, i, symbol, capital, daily_trades, config)
-                    if trade:
-                        all_trades.append(trade)
-                        total_invested_volume += trade["invested"]
-                        self.performance_tracker.update_performance(trade)
-                        
-                        month_key = trade['raw_date'].strftime('%Y-%m')
-                        if month_key not in monthly_data:
-                            monthly_data[month_key] = {"profit": 0.0, "trades": 0}
-                        monthly_data[month_key]["profit"] += trade['pnl']
-                        monthly_data[month_key]["trades"] += 1
-                        
-                        if trade["result"] == "OPEN":
-                            self.open_signals.append(trade)
-                        trades_for_symbol += 1
-                
-                print(f"✅ {symbol}: {trades_for_symbol} trades executed")
+                    # Check for potential short signal
+                    if self.is_bos(df, i) == "bear" and candle["EMA50"] < candle["EMA200"]:
+                        all_potential_signals.append({
+                            'symbol': symbol,
+                            'timestamp': signal_timestamp,
+                            'df': df,
+                            'index': i,
+                            'type': 'SHORT'
+                        })
                         
             except Exception as e:
-                print(f"❌ Error processing {symbol}: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"   ❌ Error processing {symbol}: {e}")
                 continue
         
-        # Sort trades by date
-        if all_trades:
-            all_trades.sort(key=lambda x: x['timestamp'])
-            self.trades_data = all_trades
-            print(f"📅 Sorted {len(self.trades_data)} trades chronologically")
-        else:
-            self.trades_data = []
-            print("❌ No trades executed")
+        # ✅ Step 2: Sort all signals chronologically
+        all_potential_signals.sort(key=lambda x: x['timestamp'])
+        print(f"\n📊 Found {len(all_potential_signals)} potential signals across all coins")
+        
+        # ✅ Step 3: Process signals in chronological order
+        print("\n🔄 Processing signals chronologically...\n")
+        monthly_data = {}
+        daily_trades_tracker = {}
+        
+        for signal in all_potential_signals:
+            symbol = signal['symbol']
+            df = signal['df']
+            i = signal['index']
+            signal_type = signal['type']
+            
+            # Get daily trades for this symbol
+            if symbol not in daily_trades_tracker:
+                daily_trades_tracker[symbol] = {}
+            
+            trade = None
+            if signal_type == 'LONG':
+                trade, capital = self.process_long_entry(
+                    df, i, symbol, capital, daily_trades_tracker[symbol], config
+                )
+            else:
+                trade, capital = self.process_short_entry(
+                    df, i, symbol, capital, daily_trades_tracker[symbol], config
+                )
+            
+            if trade:
+                self.trades_data.append(trade)
+                total_invested_volume += trade["invested"]
+                self.performance_tracker.update_performance(trade)
+                
+                month_key = trade['raw_date'].strftime('%Y-%m')
+                if month_key not in monthly_data:
+                    monthly_data[month_key] = {"profit": 0.0, "trades": 0}
+                monthly_data[month_key]["profit"] += trade['pnl']
+                monthly_data[month_key]["trades"] += 1
+                
+                if trade["result"] == "OPEN":
+                    self.open_signals.append(trade)
+        
+        print(f"\n📊 Processed {len(self.trades_data)} trades chronologically")
         
         # Monthly Withdrawal Logic
         if config["enable_withdrawal"] and not config["fixed_investment_mode"]:
