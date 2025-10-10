@@ -213,8 +213,9 @@ class StrategyEngine:
             if close_idx is not None:
                 close_timestamp = df.iloc[close_idx].name.timestamp()
             else:
-                # If trade is still open, set close_timestamp to far future
-                close_timestamp = float('inf')
+                # ✅ For OPEN trades, use the last available timestamp in the dataframe
+                # This ensures they only block concurrent trades during their actual timeframe
+                close_timestamp = df.iloc[-1].name.timestamp()
             
             self.open_positions.append({
                 'symbol': symbol,
@@ -269,7 +270,8 @@ class StrategyEngine:
         pnl = 0.0
         close_idx = None
         
-        for k in range(entry_idx+1, min(len(df), entry_idx + config["max_lookforward_bars"])):
+        # Check from entry to end of dataframe (not just max_lookforward_bars)
+        for k in range(entry_idx+1, len(df)):
             sc = df.iloc[k]
             
             if trade_type == "LONG":
@@ -294,6 +296,18 @@ class StrategyEngine:
                     pnl = position_size * (entry_price - tp_price)
                     close_idx = k
                     break
+        
+        # If still open after checking all data, mark as OPEN with current unrealized PnL
+        if result == "OPEN" and len(df) > entry_idx:
+            last_candle = df.iloc[-1]
+            last_price = last_candle["close"]
+            
+            if trade_type == "LONG":
+                # Calculate unrealized PnL for open long position
+                pnl = position_size * (last_price - entry_price)
+            else:
+                # Calculate unrealized PnL for open short position
+                pnl = position_size * (entry_price - last_price)
         
         return result, pnl, close_idx
     

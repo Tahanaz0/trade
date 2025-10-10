@@ -450,8 +450,10 @@
 
                         // Calculate trade duration
                         let duration = 'N/A';
+                        const entryDate = new Date(t.date);
+                        
                         if (t.close_date && t.close_date !== 'OPEN') {
-                            const entryDate = new Date(t.date);
+                            // Closed trade - calculate duration from entry to close
                             const closeDate = new Date(t.close_date);
                             const diffMs = closeDate - entryDate;
                             const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
@@ -462,6 +464,19 @@
                                 duration = `${diffDays}d ${remainingHours}h`;
                             } else {
                                 duration = `${diffHours}h`;
+                            }
+                        } else {
+                            // Open trade - calculate duration from entry to now
+                            const now = new Date();
+                            const diffMs = now - entryDate;
+                            const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+                            const diffDays = Math.floor(diffHours / 24);
+                            const remainingHours = diffHours % 24;
+                            
+                            if (diffDays > 0) {
+                                duration = `${diffDays}d ${remainingHours}h (ongoing)`;
+                            } else {
+                                duration = `${diffHours}h (ongoing)`;
                             }
                         }
 
@@ -476,11 +491,11 @@
                 <td>${t.entry}</td>
                 <td>${t.sl}</td>
                 <td>${t.tp}</td>
-                <td>$${parseFloat(t.invested).toFixed(2)}</td>
-                <td style="font-weight: 600;">$${cumulativeInvestment.toFixed(2)}</td>
+                <td>${parseFloat(t.invested).toFixed(2)}</td>
+                <td style="font-weight: 600;">${cumulativeInvestment.toFixed(2)}</td>
                 <td><span class="badge ${t.result.toLowerCase()}">${t.result}</span></td>
                 <td style="color: ${t.pnl >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 600;">${parseFloat(t.pnl).toFixed(2)}</td>
-                <td style="color: ${cumulativePnL >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 700;">$${cumulativePnL.toFixed(2)}</td>
+                <td style="color: ${cumulativePnL >= 0 ? '#27ae60' : '#e74c3c'}; font-weight: 700;">${cumulativePnL.toFixed(2)}</td>
             </tr>
         `;
                     });
